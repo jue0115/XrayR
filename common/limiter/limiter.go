@@ -16,10 +16,9 @@ import (
 	redisStore "github.com/eko/gocache/store/redis/v4"
 	goCache "github.com/patrickmn/go-cache"
 	"github.com/redis/go-redis/v9"
-	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/time/rate"
 
-	"github.com/XrayR-project/XrayR/api"
+	"github.com/jue0115/XrayR/api"
 )
 
 type UserInfo struct {
@@ -67,9 +66,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		// init redis store
 		rs := redisStore.NewRedis(redis.NewClient(
 			&redis.Options{
-				Network:  globalLimit.RedisNetwork,
 				Addr:     globalLimit.RedisAddr,
-				Username: globalLimit.RedisUsername,
 				Password: globalLimit.RedisPassword,
 				DB:       globalLimit.RedisDB,
 			}),
@@ -219,7 +216,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 			return nil, false, false
 		}
 	} else {
-		errors.LogDebug(context.Background(), "Get Inbound Limiter information failed")
+		newError("Get Inbound Limiter information failed").AtDebug().WriteToLog()
 		return nil, false, false
 	}
 }
@@ -239,7 +236,7 @@ func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, dev
 			// If the email is a new device
 			go pushIP(inboundInfo, uniqueKey, &map[string]int{ip: uid})
 		} else {
-			errors.LogErrorInner(context.Background(), err, "cache service")
+			newError("cache service").Base(err).AtError().WriteToLog()
 		}
 		return false
 	}
@@ -265,7 +262,7 @@ func pushIP(inboundInfo *InboundInfo, uniqueKey string, ipMap *map[string]int) {
 	defer cancel()
 
 	if err := inboundInfo.GlobalLimit.globalOnlineIP.Set(ctx, uniqueKey, ipMap); err != nil {
-		errors.LogErrorInner(context.Background(), err, "cache service")
+		newError("cache service").Base(err).AtError().WriteToLog()
 	}
 }
 

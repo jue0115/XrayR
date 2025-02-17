@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/XrayR-project/XrayR/api"
-	"github.com/XrayR-project/XrayR/api/proxypanel"
+	"github.com/jue0115/XrayR/api"
+	"github.com/jue0115/XrayR/api/proxypanel"
 )
 
 func CreateClient() api.API {
@@ -154,8 +154,8 @@ func TestReportIllegal(t *testing.T) {
 	client := CreateClient()
 
 	detectResult := []api.DetectResult{
-		{UID: 1, RuleID: 1},
-		{UID: 1, RuleID: 2},
+		{1, 1},
+		{1, 2},
 	}
 	client.Debug()
 	err := client.ReportIllegal(&detectResult)

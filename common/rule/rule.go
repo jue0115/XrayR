@@ -2,7 +2,6 @@
 package rule
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -10,9 +9,8 @@ import (
 	"sync"
 
 	mapset "github.com/deckarep/golang-set"
-	"github.com/xtls/xray-core/common/errors"
 
-	"github.com/XrayR-project/XrayR/api"
+	"github.com/jue0115/XrayR/api"
 )
 
 type Manager struct {
@@ -67,7 +65,7 @@ func (r *Manager) Detect(tag string, destination string, email string) (reject b
 			l := strings.Split(email, "|")
 			uid, err := strconv.Atoi(l[len(l)-1])
 			if err != nil {
-				errors.LogDebug(context.Background(), fmt.Sprintf("Record illegal behavior failed! Cannot find user's uid: %s", email))
+				newError(fmt.Sprintf("Record illegal behavior failed! Cannot find user's uid: %s", email)).AtDebug().WriteToLog()
 				return reject
 			}
 			newSet := mapset.NewSetWith(api.DetectResult{UID: uid, RuleID: hitRuleID})

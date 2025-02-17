@@ -4,17 +4,16 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"regexp"
 	"strconv"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/go-resty/resty/v2"
 
-	"github.com/XrayR-project/XrayR/api"
+	"github.com/jue0115/XrayR/api"
 )
 
 // APIClient create a api client to the panel.
