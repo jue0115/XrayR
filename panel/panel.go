@@ -23,7 +23,7 @@ import (
 	"github.com/jue0115/XrayR/api/proxypanel"
 	"github.com/jue0115/XrayR/api/sspanel"
 	"github.com/jue0115/XrayR/api/v2raysocks"
-	_ "github.com/jue0115/XrayR/main/distro/all"
+   _ "github.com/jue0115/XrayR/cmd/distro/all"
 	"github.com/jue0115/XrayR/service"
 	"github.com/jue0115/XrayR/service/controller"
 )
@@ -177,7 +177,7 @@ func (p *Panel) Start() {
 		switch nodeConfig.PanelType {
 		case "SSpanel":
 			apiClient = sspanel.New(nodeConfig.ApiConfig)
-		case "NewV2board":
+		case "NewV2board", "V2board":
 			apiClient = newV2board.New(nodeConfig.ApiConfig)
 		case "PMpanel":
 			apiClient = pmpanel.New(nodeConfig.ApiConfig)
