@@ -195,9 +195,9 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	}
 
 	if c.DisableCustomConfig || isExpired {
-		if isExpired {
-			log.Print("The panel version is expired, it is recommended to update immediately")
-		}
+		//if isExpired {
+		//	log.Print("The panel version is expired, it is recommended to update immediately")
+		//}
 
 		switch c.NodeType {
 		case "V2ray":
