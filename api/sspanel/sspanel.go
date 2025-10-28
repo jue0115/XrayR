@@ -305,7 +305,7 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	c.LastReportOnline = reportOnline // Update LastReportOnline
 
 	postData := &PostData{Data: data}
-	path := "/mod_mu/users/aliveip"
+	path := fmt.Sprintf("/mod_mu/users/aliveip")
 	res, err := c.client.R().
 		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
 		SetBody(postData).
@@ -523,11 +523,6 @@ func (c *APIClient) ParseSSNodeResponse(nodeInfoResponse *NodeInfoResponse) (*ap
 
 	if err := json.Unmarshal(response.Data, userListResponse); err != nil {
 		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(userListResponse), err)
-	}
-
-	// init server port
-	if len(*userListResponse) != 0 {
-		port = (*userListResponse)[0].Port
 	}
 
 	if c.SpeedLimit > 0 {
