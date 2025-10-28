@@ -296,11 +296,7 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	data := make([]OnlineUser, len(*onlineUserList))
 	for i, user := range *onlineUserList {
 		data[i] = OnlineUser{UID: user.UID, IP: user.IP}
-		if _, ok := reportOnline[user.UID]; ok {
-			reportOnline[user.UID]++
-		} else {
-			reportOnline[user.UID] = 1
-		}
+		reportOnline[user.UID]++ // will start from 1 if key doesn’t exist
 	}
 	c.LastReportOnline = reportOnline // Update LastReportOnline
 
@@ -693,7 +689,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 		c.access.Unlock()
 	}()
 
-	var deviceLimit, localDeviceLimit int = 0, 0
+	var deviceLimit, localDeviceLimit = 0, 0
 	var speedLimit uint64 = 0
 	var userList []api.UserInfo
 	for _, user := range *userInfoResponse {
@@ -744,10 +740,10 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 // Only available for SSPanel version >= 2021.11
 func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
 	var (
-		speedLimit                 uint64 = 0
-		enableTLS, enableVless     bool
-		alterID                    uint16 = 0
-		tlsType, transportProtocol string
+		speedLimit             uint64 = 0
+		enableTLS, enableVless bool
+		alterID                uint16 = 0
+		transportProtocol      string
 	)
 
 	// Check if custom_config is null
@@ -779,8 +775,8 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		transportProtocol = "tcp"
 	case "V2ray":
 		transportProtocol = nodeConfig.Network
-		tlsType = nodeConfig.Security
 
+		tlsType := nodeConfig.Security
 		if tlsType == "tls" || tlsType == "xtls" {
 			enableTLS = true
 		}
@@ -790,12 +786,7 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		}
 	case "Trojan":
 		enableTLS = true
-		tlsType = "tls"
 		transportProtocol = "tcp"
-
-		if nodeConfig.Security != "" {
-			tlsType = nodeConfig.Security // try to read security from config
-		}
 
 		// Select transport protocol
 		if nodeConfig.Network != "" {
