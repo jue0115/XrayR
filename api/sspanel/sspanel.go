@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"regexp"
@@ -12,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 
 	"github.com/go-resty/resty/v2"
 
@@ -95,13 +94,8 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 	if path != "" {
 		// open the file
 		file, err := os.Open(path)
+		defer file.Close()
 
-		defer func(file *os.File) {
-			err := file.Close()
-			if err != nil {
-				log.Printf("Error when closing file: %s", err)
-			}
-		}(file)
 		// handle errors while opening
 		if err != nil {
 			log.Printf("Error when opening file: %s", err)
@@ -215,13 +209,13 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		nodeInfo, err = c.ParseSSPanelNodeInfo(nodeInfoResponse)
 		if err != nil {
 			res, _ := json.Marshal(nodeInfoResponse)
-			return nil, fmt.Errorf("parse node info failed: %s, \nError: %s, \nPlease check the doc of custom_config for help: https://xrayr-project.github.io/XrayR-doc/dui-jie-sspanel/sspanel/sspanel_custom_config", string(res), err)
+			return nil, fmt.Errorf("Parse node info failed: %s, \nError: %s, \nPlease check the doc of custom_config for help: https://xrayr-project.github.io/XrayR-doc/dui-jie-sspanel/sspanel/sspanel_custom_config", string(res), err)
 		}
 	}
 
 	if err != nil {
 		res, _ := json.Marshal(nodeInfoResponse)
-		return nil, fmt.Errorf("parse node info failed: %s, \nError: %s", string(res), err)
+		return nil, fmt.Errorf("Parse node info failed: %s, \nError: %s", string(res), err)
 	}
 
 	return nodeInfo, nil
@@ -296,12 +290,16 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	data := make([]OnlineUser, len(*onlineUserList))
 	for i, user := range *onlineUserList {
 		data[i] = OnlineUser{UID: user.UID, IP: user.IP}
-		reportOnline[user.UID]++ // will start from 1 if key doesn’t exist
+		if _, ok := reportOnline[user.UID]; ok {
+			reportOnline[user.UID]++
+		} else {
+			reportOnline[user.UID] = 1
+		}
 	}
 	c.LastReportOnline = reportOnline // Update LastReportOnline
 
 	postData := &PostData{Data: data}
-	path := "/mod_mu/users/aliveip"
+	path := fmt.Sprintf("/mod_mu/users/aliveip")
 	res, err := c.client.R().
 		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
 		SetBody(postData).
@@ -689,7 +687,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 		c.access.Unlock()
 	}()
 
-	var deviceLimit, localDeviceLimit = 0, 0
+	var deviceLimit, localDeviceLimit int = 0, 0
 	var speedLimit uint64 = 0
 	var userList []api.UserInfo
 	for _, user := range *userInfoResponse {
