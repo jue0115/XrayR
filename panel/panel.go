@@ -154,7 +154,7 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	if err != nil {
 		log.Panicf("failed to create instance: %s", err)
 	}
-	log.Print("Xray Core Version: %s", core.Version())
+	log.Printf("Xray Core Version: %s", core.Version())
 
 	return server
 }
