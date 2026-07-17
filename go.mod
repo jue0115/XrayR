@@ -9,7 +9,7 @@ require (
 	github.com/bitly/go-simplejson v0.5.1
 	github.com/deckarep/golang-set v1.8.0
 	github.com/eko/gocache/lib/v4 v4.1.6
-	github.com/eko/gocache/store/go_cache/v4 v4.2.2
+	github.com/eko/gocache/store/go_cache/v4 v4.2.5
 	github.com/eko/gocache/store/redis/v4 v4.2.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-acme/lego/v4 v4.16.1
@@ -271,7 +271,7 @@ require (
 	go.uber.org/ratelimit v0.3.1 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/arch v0.7.0 // indirect
-	golang.org/x/exp v0.0.0-20240531132922-fd00a4e0eefc // indirect
+	golang.org/x/exp v0.0.0-20251209150349-8475f28825e9 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
