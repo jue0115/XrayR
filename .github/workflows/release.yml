@@ -66,15 +66,26 @@ jobs:
         run: go mod download
 
 
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Building version: ${VERSION}"
+
       - name: Build XrayR
         run: |
           mkdir -p build_assets
-          go build -v -o build_assets/XrayR -trimpath -ldflags "-s -w -buildid="
+          go build -v -o build_assets/XrayR -trimpath -ldflags "-s -w -buildid= -X 'github.com/XrayR-project/XrayR/cmd.version=${VERSION}'"
 
       - name: Build Mips softfloat XrayR
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
-          GOMIPS=softfloat go build -v -o build_assets/XrayR_softfloat -trimpath -ldflags "-s -w -buildid="
+          GOMIPS=softfloat go build -v -o build_assets/XrayR_softfloat -trimpath -ldflags "-s -w -buildid= -X 'github.com/XrayR-project/XrayR/cmd.version=${VERSION}'"
       - name: Rename Windows XrayR
         if: matrix.goos == 'windows'
         run: |
