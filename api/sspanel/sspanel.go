@@ -208,6 +208,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 			nodeInfo, err = c.ParseSSNodeResponse(nodeInfoResponse)
 		case "Shadowsocks-Plugin":
 			nodeInfo, err = c.ParseSSPluginNodeResponse(nodeInfoResponse)
+		case "Hysteria":
+			nodeInfo, err = c.ParseHysteriaNodeResponse(nodeInfoResponse)
 		default:
 			return nil, fmt.Errorf("unsupported Node type: %s", c.NodeType)
 		}
@@ -793,6 +795,9 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		if nodeConfig.Network != "" {
 			transportProtocol = nodeConfig.Network // try to read transport protocol from config
 		}
+	case "Hysteria":
+		transportProtocol = "hysteria" // Hysteria uses its own transport protocol
+		enableTLS = true               // Hysteria always uses TLS
 	}
 
 	// parse reality config
@@ -858,3 +863,76 @@ func compareVersion(version1, version2 string) int {
 	}
 	return 0
 }
+
+// ParseHysteriaNodeResponse parse the response for Hysteria protocol
+func (c *APIClient) ParseHysteriaNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
+	// 域名或IP;port=连接端口#偏移端口|host=xx|obfs=xx
+	// gz.aaa.com;port=443#12345|host=hk.aaa.com|obfs=secret123
+	var p, host, obfs, outsidePort, insidePort string
+	var speedLimit uint64 = 0
+
+	if nodeInfoResponse.RawServerString == "" {
+		return nil, fmt.Errorf("no server info in response")
+	}
+	if result := firstPortRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
+		outsidePort = result[1]
+	}
+	if result := secondPortRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
+		insidePort = result[1]
+	}
+	if result := hostRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
+		host = result[1]
+	}
+
+	if insidePort != "" {
+		p = insidePort
+	} else {
+		p = outsidePort
+	}
+
+	parsedPort, err := strconv.ParseInt(p, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	port := uint32(parsedPort)
+
+	// default host to server address if not provided
+	if host == "" {
+		host = strings.Split(nodeInfoResponse.RawServerString, ";")[0]
+	}
+
+	// Parse optional obfs param from the "|"-delimited section
+	serverConf := strings.Split(nodeInfoResponse.RawServerString, ";")
+	if len(serverConf) > 1 {
+		extraServerConf := strings.Split(serverConf[1], "|")
+		for _, item := range extraServerConf {
+			conf := strings.SplitN(item, "=", 2)
+			if len(conf) != 2 {
+				continue
+			}
+			if strings.TrimSpace(conf[0]) == "obfs" {
+				obfs = strings.TrimSpace(conf[1])
+			}
+		}
+	}
+
+	if c.SpeedLimit > 0 {
+		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
+	} else {
+		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
+	}
+
+	nodeInfo := &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              port,
+		SpeedLimit:        speedLimit,
+		TransportProtocol: "hysteria",
+		EnableTLS:         true,
+		Host:              host,
+		HysteriaObfs:      obfs,
+	}
+
+	return nodeInfo, nil
+}
+

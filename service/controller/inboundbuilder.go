@@ -119,11 +119,13 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		}
 
 		proxySetting.NetworkList = &conf.NetworkList{"tcp", "udp"}
-		proxySetting.IVCheck = true
-		if config.DisableIVCheck {
-			proxySetting.IVCheck = false
-		}
 
+	case "Hysteria":
+		protocol = "hysteria"
+		proxySetting = &conf.HysteriaServerConfig{
+			Version: 2,
+			Users:   []*conf.HysteriaUserConfig{},
+		}
 	case "dokodemo-door":
 		protocol = "dokodemo-door"
 		proxySetting = struct {
@@ -134,7 +136,7 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			NetworkList: []string{"tcp", "udp"},
 		}
 	default:
-		return nil, fmt.Errorf("unsupported node type: %s, Only support: V2ray, Trojan, Shadowsocks, and Shadowsocks-Plugin", nodeInfo.NodeType)
+		return nil, fmt.Errorf("unsupported node type: %s, Only support: V2ray, Trojan, Shadowsocks, Shadowsocks-Plugin, and Hysteria", nodeInfo.NodeType)
 	}
 
 	setting, err := json.Marshal(proxySetting)
@@ -189,6 +191,19 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			Host: nodeInfo.Host,
 		}
 		streamSetting.SplitHTTPSettings = splithttpSetting
+	case "hysteria":
+		hysteriaSetting := &conf.HysteriaConfig{
+			Version:        2,
+			UdpIdleTimeout: 60,
+		}
+		streamSetting.HysteriaSettings = hysteriaSetting
+		if nodeInfo.HysteriaObfs != "" {
+			settings, _ := json.Marshal(map[string]string{"password": nodeInfo.HysteriaObfs})
+			rawSettings := json.RawMessage(settings)
+			streamSetting.FinalMask = &conf.FinalMask{
+				Udp: []conf.Mask{{Type: "salamander", Settings: &rawSettings}},
+			}
+		}
 	}
 	streamSetting.Network = &transportProtocol
 
@@ -237,6 +252,12 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		}
 		tlsSettings := &conf.TLSConfig{
 			RejectUnknownSNI: config.CertConfig.RejectUnknownSni,
+		}
+		// Hysteria2 runs HTTP/3 over QUIC and requires the "h3" ALPN. Without it
+		// the TLS layer falls back to the default {"h2","http/1.1"}, ALPN
+		// negotiation fails, and the QUIC handshake is closed before auth.
+		if networkType == "hysteria" {
+			tlsSettings.ALPN = &conf.StringList{"h3"}
 		}
 		tlsSettings.Certs = append(tlsSettings.Certs, &conf.TLSCertConfig{CertFile: certFile, KeyFile: keyFile, OcspStapling: 3600})
 		streamSetting.TLSSettings = tlsSettings

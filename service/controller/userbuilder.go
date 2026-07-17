@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/hysteria/account"
 
 	"github.com/XrayR-project/XrayR/api"
 )
@@ -139,6 +140,21 @@ func (c *Controller) buildSSPluginUser(userInfo *[]api.UserInfo) (users []*proto
 					}),
 				}
 			}
+		}
+	}
+	return users
+}
+
+func (c *Controller) buildHysteriaUser(userInfo *[]api.UserInfo) (users []*protocol.User) {
+	users = make([]*protocol.User, len(*userInfo))
+	for i, user := range *userInfo {
+		hysteriaAccount := &account.Account{
+			Auth: user.UUID,
+		}
+		users[i] = &protocol.User{
+			Level:   0,
+			Email:   c.buildUserTag(&user),
+			Account: serial.ToTypedMessage(hysteriaAccount),
 		}
 	}
 	return users

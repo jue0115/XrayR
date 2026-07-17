@@ -34,7 +34,7 @@ var errSniffingTimeout = newError("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader *pipe.Reader
+	reader buf.TimeoutReader
 	cache  buf.MultiBuffer
 }
 
@@ -88,7 +88,9 @@ func (r *cachedReader) Interrupt() {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.Interrupt()
+	if i, ok := r.reader.(common.Interruptible); ok {
+		i.Interrupt()
+	}
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -263,12 +265,15 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if err != nil {
 		return nil, err
 	}
-	if !sniffingRequest.Enabled {
+	pipeReader, isPipe := outbound.Reader.(*pipe.Reader)
+	if !sniffingRequest.Enabled || !isPipe {
+		// Skip sniffing for non-pipe readers (e.g. VLESS Vision's *proxy.VisionReader),
+		// which are stateful and must not be wrapped/read out of band.
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
 		go func() {
 			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
+				reader: pipeReader,
 			}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
@@ -291,6 +296,56 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	return inbound, nil
 }
 
+// wrapLinkStats attaches per-user traffic counters and speed/device limits to a
+// Link whose reader/writer are wired directly to the client connection (the VLESS
+// Vision path via DispatchLink). Unlike Dispatch, DispatchLink never calls
+// getLink, so without this the newer xray-core Vision flow bypasses all traffic
+// accounting and the panel sees zero usage. Mirrors upstream core's WrapLink,
+// plus XrayR's speed-limit / device-limit enforcement.
+func (d *DefaultDispatcher) wrapLinkStats(ctx context.Context, link *transport.Link) (*transport.Link, error) {
+	sessionInbound := session.InboundFromContext(ctx)
+	var user *protocol.MemoryUser
+	if sessionInbound != nil {
+		// Disable splice so Vision's direct-copy can't bypass the counting writer.
+		sessionInbound.CanSpliceCopy = 3
+		user = sessionInbound.User
+	}
+
+	// Wrap the reader so uplink bytes can be counted (upstream WrapLink pattern).
+	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+
+	if user != nil && len(user.Email) > 0 {
+		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
+		if reject {
+			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
+			common.Close(link.Writer)
+			common.Interrupt(link.Reader)
+			return nil, newError("Devices reach the limit: ", user.Email)
+		}
+		if ok {
+			link.Writer = d.Limiter.RateWriter(link.Writer, bucket)
+		}
+
+		p := d.policy.ForLevel(user.Level)
+		if p.Stats.UserUplink {
+			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+			}
+		}
+		if p.Stats.UserDownlink {
+			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+				link.Writer = &SizeStatWriter{
+					Counter: c,
+					Writer:  link.Writer,
+				}
+			}
+		}
+	}
+	return link, nil
+}
+
 // DispatchLink implements routing.Dispatcher.
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
 	if !destination.IsValid() {
@@ -309,31 +364,43 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
+
+	// Attach traffic accounting + limits. DispatchLink wires the client connection
+	// straight to the outbound, so this is the only place usage can be counted.
+	var err error
+	outbound, err = d.wrapLinkStats(ctx, outbound)
+	if err != nil {
+		return err
+	}
+
 	sniffingRequest := content.SniffingRequest
+	// DispatchLink must run synchronously: unlike Dispatch it wires the inbound
+	// connection directly to the outbound (no decoupling pipe), so the caller's
+	// Process has to stay blocked for the whole session. Returning early lets the
+	// inbound close the connection and cancel the outbound dial ("operation was
+	// canceled"), which breaks VLESS Vision on newer xray-core.
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(ctx, outbound, destination)
 	} else {
-		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
+		cReader := &cachedReader{
+			reader: outbound.Reader.(buf.TimeoutReader),
+		}
+		outbound.Reader = cReader
+		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		if err == nil {
+			content.Protocol = result.Protocol()
+		}
+		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+			domain := result.Domain()
+			errors.LogInfo(ctx, "sniffed domain: ", domain)
+			destination.Address = net.ParseAddress(domain)
+			if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
+				ob.RouteTarget = destination
+			} else {
+				ob.Target = destination
 			}
-			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-			if err == nil {
-				content.Protocol = result.Protocol()
-			}
-			if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-				domain := result.Domain()
-				errors.LogInfo(ctx, "sniffed domain: ", domain)
-				destination.Address = net.ParseAddress(domain)
-				if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
-					ob.RouteTarget = destination
-				} else {
-					ob.Target = destination
-				}
-			}
-			d.routedDispatch(ctx, outbound, destination)
-		}()
+		}
+		d.routedDispatch(ctx, outbound, destination)
 	}
 
 	return nil
@@ -386,21 +453,6 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
-	outbounds := session.OutboundsFromContext(ctx)
-	ob := outbounds[len(outbounds)-1]
-	if hosts, ok := d.dns.(dns.HostsLookup); ok && destination.Address.Family().IsDomain() {
-		proxied := hosts.LookupHosts(ob.Target.String())
-		if proxied != nil {
-			ro := ob.RouteTarget == destination
-			destination.Address = *proxied
-			if ro {
-				ob.RouteTarget = destination
-			} else {
-				ob.Target = destination
-			}
-		}
-	}
-
 	var handler outbound.Handler
 
 	// Check if domain and protocol hit the rule
