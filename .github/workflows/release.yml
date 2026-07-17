@@ -29,7 +29,7 @@ jobs:
           - goos: windows
             goarch: amd64
           - goos: windows
-            goarch: arm64
+            goarch: 386
           - goos: linux
             goarch: amd64
           - goos: linux
