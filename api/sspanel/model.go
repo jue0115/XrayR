@@ -33,6 +33,8 @@ type CustomConfig struct {
 	Flow           string          `json:"flow"`
 	EnableREALITY  bool            `json:"enable_reality"`
 	RealityOpts    *REALITYConfig  `json:"reality-opts"`
+	HysteriaAuth   string          `json:"hysteria_auth"`   // Hysteria authentication password
+	HysteriaObfs   string          `json:"hysteria_obfs"`   // Hysteria obfuscation type (optional)
 }
 
 // UserResponse is the response of user

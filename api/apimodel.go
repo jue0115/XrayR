@@ -78,6 +78,8 @@ type NodeInfo struct {
 	Security            string
 	Key                 string
 	RejectUnknownSni    bool
+	HysteriaAuth        string // Hysteria authentication password
+	HysteriaObfs        string // Hysteria obfuscation type (optional)
 }
 
 type UserInfo struct {
