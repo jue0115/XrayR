@@ -1,0 +1,4 @@
+# Force-include everything under third_party (vendored xray-core with local patch).
+# The repo-root .gitignore has broad rules (XrayR*, main, cert, config.yml, out,
+# gen, *.dat, *.test ...) that would otherwise drop files the vendored build needs.
+!**

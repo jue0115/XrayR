@@ -304,7 +304,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				}
 			}
 		}
-		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
+		if len(deleted) > 0 || len(added) > 0 {
+			c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
+		}
 	}
 	c.userList = newUserInfo
 	return nil
