@@ -151,7 +151,7 @@ func (c *Controller) Start() error {
 	)
 
 	// Check cert service in need
-	if c.nodeInfo.EnableTLS && c.config.EnableREALITY == false {
+	if c.nodeInfo.EnableTLS && !c.config.EnableREALITY && !c.nodeInfo.EnableREALITY {
 		c.tasks = append(c.tasks, periodicTask{
 			tag: "cert monitor",
 			Periodic: &task.Periodic{
@@ -621,7 +621,7 @@ func (c *Controller) buildNodeTag() string {
 
 // Check Cert
 func (c *Controller) certMonitor() error {
-	if c.nodeInfo.EnableTLS && c.config.EnableREALITY == false {
+	if c.nodeInfo.EnableTLS && !c.config.EnableREALITY && !c.nodeInfo.EnableREALITY {
 		switch c.config.CertConfig.CertMode {
 		case "dns", "http", "tls":
 			lego, err := mylego.New(c.config.CertConfig)

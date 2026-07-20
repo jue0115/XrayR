@@ -28,21 +28,20 @@ var (
 
 // APIClient create a api client to the panel.
 type APIClient struct {
-	client              *resty.Client
-	APIHost             string
-	NodeID              int
-	Key                 string
-	NodeType            string
-	EnableVless         bool
-	VlessFlow           string
-	SpeedLimit          float64
-	DeviceLimit         int
-	DisableCustomConfig bool
-	LocalRuleList       []api.DetectRule
-	LastReportOnline    map[int]int
-	access              sync.Mutex
-	version             string
-	eTags               map[string]string
+	client           *resty.Client
+	APIHost          string
+	NodeID           int
+	Key              string
+	NodeType         string
+	EnableVless      bool
+	VlessFlow        string
+	SpeedLimit       float64
+	DeviceLimit      int
+	LocalRuleList    []api.DetectRule
+	LastReportOnline map[int]int
+	access           sync.Mutex
+	version          string
+	eTags            map[string]string
 }
 
 // New create api instance
@@ -73,19 +72,18 @@ func New(apiConfig *api.Config) *APIClient {
 	localRuleList := readLocalRuleList(apiConfig.RuleListPath)
 
 	return &APIClient{
-		client:              client,
-		NodeID:              apiConfig.NodeID,
-		Key:                 apiConfig.Key,
-		APIHost:             apiConfig.APIHost,
-		NodeType:            apiConfig.NodeType,
-		EnableVless:         apiConfig.EnableVless,
-		VlessFlow:           apiConfig.VlessFlow,
-		SpeedLimit:          apiConfig.SpeedLimit,
-		DeviceLimit:         apiConfig.DeviceLimit,
-		LocalRuleList:       localRuleList,
-		DisableCustomConfig: apiConfig.DisableCustomConfig,
-		LastReportOnline:    make(map[int]int),
-		eTags:               make(map[string]string),
+		client:           client,
+		NodeID:           apiConfig.NodeID,
+		Key:              apiConfig.Key,
+		APIHost:          apiConfig.APIHost,
+		NodeType:         apiConfig.NodeType,
+		EnableVless:      apiConfig.EnableVless,
+		VlessFlow:        apiConfig.VlessFlow,
+		SpeedLimit:       apiConfig.SpeedLimit,
+		DeviceLimit:      apiConfig.DeviceLimit,
+		LocalRuleList:    localRuleList,
+		LastReportOnline: make(map[int]int),
+		eTags:            make(map[string]string),
 	}
 }
 
@@ -187,38 +185,21 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(nodeInfoResponse), err)
 	}
 
-	// determine ssPanel version, if disable custom config or version < 2021.11, then use old api
 	c.version = nodeInfoResponse.Version
-	var isExpired bool
-	if compareVersion(c.version, "2021.11") == -1 {
-		isExpired = true
-	}
 
-	if c.DisableCustomConfig || isExpired {
-		//if isExpired {
-		//	log.Print("The panel version is expired, it is recommended to update immediately")
-		//}
-
-		switch c.NodeType {
-		case "V2ray":
-			nodeInfo, err = c.ParseV2rayNodeResponse(nodeInfoResponse)
-		case "Trojan":
-			nodeInfo, err = c.ParseTrojanNodeResponse(nodeInfoResponse)
-		case "Shadowsocks":
-			nodeInfo, err = c.ParseSSNodeResponse(nodeInfoResponse)
-		case "Shadowsocks-Plugin":
-			nodeInfo, err = c.ParseSSPluginNodeResponse(nodeInfoResponse)
-		case "Hysteria":
-			nodeInfo, err = c.ParseHysteriaNodeResponse(nodeInfoResponse)
-		default:
-			return nil, fmt.Errorf("unsupported Node type: %s", c.NodeType)
-		}
-	} else {
-		nodeInfo, err = c.ParseSSPanelNodeInfo(nodeInfoResponse)
-		if err != nil {
-			res, _ := json.Marshal(nodeInfoResponse)
-			return nil, fmt.Errorf("parse node info failed: %s, \nError: %s, \nPlease check the doc of custom_config for help: https://xrayr-project.github.io/XrayR-doc/dui-jie-sspanel/sspanel/sspanel_custom_config", string(res), err)
-		}
+	switch c.NodeType {
+	case "V2ray", "Vmess", "Vless":
+		nodeInfo, err = c.ParseV2rayNodeResponse(nodeInfoResponse)
+	case "Trojan":
+		nodeInfo, err = c.ParseTrojanNodeResponse(nodeInfoResponse)
+	case "Shadowsocks":
+		nodeInfo, err = c.ParseSSNodeResponse(nodeInfoResponse)
+	case "Shadowsocks-Plugin":
+		nodeInfo, err = c.ParseSSPluginNodeResponse(nodeInfoResponse)
+	case "Hysteria":
+		nodeInfo, err = c.ParseHysteriaNodeResponse(nodeInfoResponse)
+	default:
+		return nil, fmt.Errorf("unsupported Node type: %s", c.NodeType)
 	}
 
 	if err != nil {
@@ -411,7 +392,7 @@ func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
 
 // ParseV2rayNodeResponse parse the response for the given node info format
 func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var enableTLS bool
+	var enableTLS, enableREALITY bool
 	var path, host, transportProtocol, serviceName, HeaderType string
 	var header json.RawMessage
 	var speedLimit uint64 = 0
@@ -438,6 +419,9 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 		switch value {
 		case "tls":
 			enableTLS = true
+		case "reality":
+			enableTLS = true
+			enableREALITY = true
 		default:
 			if value != "" {
 				transportProtocol = value
@@ -495,6 +479,7 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 		VlessFlow:         c.VlessFlow,
 		ServiceName:       serviceName,
 		Header:            header,
+		EnableREALITY:     enableREALITY,
 	}
 
 	return nodeInfo, nil
@@ -737,106 +722,6 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 	}
 
 	return &userList, nil
-}
-
-// ParseSSPanelNodeInfo parse the response for the given node info format
-// Only available for SSPanel version >= 2021.11
-func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var (
-		speedLimit             uint64 = 0
-		enableTLS, enableVless bool
-		alterID                uint16 = 0
-		transportProtocol      string
-	)
-
-	// Check if custom_config is null
-	if len(nodeInfoResponse.CustomConfig) == 0 {
-		return nil, errors.New("custom_config is empty, disable custom config")
-	}
-
-	nodeConfig := new(CustomConfig)
-	err := json.Unmarshal(nodeInfoResponse.CustomConfig, nodeConfig)
-	if err != nil {
-		return nil, fmt.Errorf("custom_config format error: %v", err)
-	}
-
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-
-	parsedPort, err := strconv.ParseInt(nodeConfig.OffsetPortNode, 10, 32)
-	if err != nil {
-		return nil, err
-	}
-
-	port := uint32(parsedPort)
-
-	switch c.NodeType {
-	case "Shadowsocks":
-		transportProtocol = "tcp"
-	case "V2ray":
-		transportProtocol = nodeConfig.Network
-
-		tlsType := nodeConfig.Security
-		if tlsType == "tls" || tlsType == "xtls" {
-			enableTLS = true
-		}
-
-		if nodeConfig.EnableVless == "1" {
-			enableVless = true
-		}
-	case "Trojan":
-		enableTLS = true
-		transportProtocol = "tcp"
-
-		// Select transport protocol
-		if nodeConfig.Network != "" {
-			transportProtocol = nodeConfig.Network // try to read transport protocol from config
-		}
-	case "Hysteria":
-		transportProtocol = "hysteria" // Hysteria uses its own transport protocol
-		enableTLS = true               // Hysteria always uses TLS
-	}
-
-	// parse reality config
-	realityConfig := new(api.REALITYConfig)
-	if nodeConfig.RealityOpts != nil {
-		r := nodeConfig.RealityOpts
-		realityConfig = &api.REALITYConfig{
-			Dest:             r.Dest,
-			ProxyProtocolVer: r.ProxyProtocolVer,
-			ServerNames:      r.ServerNames,
-			PrivateKey:       r.PrivateKey,
-			MinClientVer:     r.MinClientVer,
-			MaxClientVer:     r.MaxClientVer,
-			MaxTimeDiff:      r.MaxTimeDiff,
-			ShortIds:         r.ShortIds,
-		}
-	}
-
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          c.NodeType,
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		AlterID:           alterID,
-		TransportProtocol: transportProtocol,
-		Host:              nodeConfig.Host,
-		Path:              nodeConfig.Path,
-		EnableTLS:         enableTLS,
-		EnableVless:       enableVless,
-		VlessFlow:         nodeConfig.Flow,
-		CypherMethod:      nodeConfig.Method,
-		ServiceName:       nodeConfig.Servicename,
-		Header:            nodeConfig.Header,
-		EnableREALITY:     nodeConfig.EnableREALITY,
-		REALITYConfig:     realityConfig,
-	}
-
-	return nodeInfo, nil
 }
 
 // compareVersion, version1 > version2 return 1, version1 < version2 return -1, 0 means equal

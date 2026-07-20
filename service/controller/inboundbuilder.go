@@ -227,7 +227,7 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 				ShortIds:     r.ShortIds,
 			}
 		}
-	} else if config.EnableREALITY && config.REALITYConfigs != nil {
+	} else if (config.EnableREALITY || nodeInfo.EnableREALITY) && config.REALITYConfigs != nil {
 		isREALITY = true
 		streamSetting.Security = "reality"
 

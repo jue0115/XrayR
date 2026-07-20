@@ -20,18 +20,17 @@ import (
 
 // APIClient API config
 type APIClient struct {
-	ctx                 context.Context
-	APIHost             string
-	NodeID              int
-	Key                 string
-	NodeType            string
-	EnableVless         bool
-	VlessFlow           string
-	Timeout             int
-	SpeedLimit          float64
-	DeviceLimit         int
-	RuleListPath        string
-	DisableCustomConfig bool
+	ctx          context.Context
+	APIHost      string
+	NodeID       int
+	Key          string
+	NodeType     string
+	EnableVless  bool
+	VlessFlow    string
+	Timeout      int
+	SpeedLimit   float64
+	DeviceLimit  int
+	RuleListPath string
 
 	LocalRuleList []api.DetectRule
 }
@@ -42,17 +41,16 @@ func New(apiConfig *api.Config) *APIClient {
 	//https://goframe.org/pages/viewpage.action?pageId=1114381
 
 	apiClient := &APIClient{
-		ctx:                 context.Background(),
-		APIHost:             apiConfig.APIHost,
-		NodeID:              apiConfig.NodeID,
-		Key:                 apiConfig.Key,
-		NodeType:            apiConfig.NodeType,
-		EnableVless:         apiConfig.EnableVless,
-		VlessFlow:           apiConfig.VlessFlow,
-		Timeout:             apiConfig.Timeout,
-		DeviceLimit:         apiConfig.DeviceLimit,
-		RuleListPath:        apiConfig.RuleListPath,
-		DisableCustomConfig: apiConfig.DisableCustomConfig,
+		ctx:          context.Background(),
+		APIHost:      apiConfig.APIHost,
+		NodeID:       apiConfig.NodeID,
+		Key:          apiConfig.Key,
+		NodeType:     apiConfig.NodeType,
+		EnableVless:  apiConfig.EnableVless,
+		VlessFlow:    apiConfig.VlessFlow,
+		Timeout:      apiConfig.Timeout,
+		DeviceLimit:  apiConfig.DeviceLimit,
+		RuleListPath: apiConfig.RuleListPath,
 
 		LocalRuleList: readLocalRuleList(apiConfig.RuleListPath), //加载本地路由规则
 	}

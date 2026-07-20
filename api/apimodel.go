@@ -15,17 +15,16 @@ const (
 
 // Config API config
 type Config struct {
-	APIHost             string  `mapstructure:"ApiHost"`
-	NodeID              int     `mapstructure:"NodeID"`
-	Key                 string  `mapstructure:"ApiKey"`
-	NodeType            string  `mapstructure:"NodeType"`
-	EnableVless         bool    `mapstructure:"EnableVless"`
-	VlessFlow           string  `mapstructure:"VlessFlow"`
-	Timeout             int     `mapstructure:"Timeout"`
-	SpeedLimit          float64 `mapstructure:"SpeedLimit"`
-	DeviceLimit         int     `mapstructure:"DeviceLimit"`
-	RuleListPath        string  `mapstructure:"RuleListPath"`
-	DisableCustomConfig bool    `mapstructure:"DisableCustomConfig"`
+	APIHost      string  `mapstructure:"ApiHost"`
+	NodeID       int     `mapstructure:"NodeID"`
+	Key          string  `mapstructure:"ApiKey"`
+	NodeType     string  `mapstructure:"NodeType"`
+	EnableVless  bool    `mapstructure:"EnableVless"`
+	VlessFlow    string  `mapstructure:"VlessFlow"`
+	Timeout      int     `mapstructure:"Timeout"`
+	SpeedLimit   float64 `mapstructure:"SpeedLimit"`
+	DeviceLimit  int     `mapstructure:"DeviceLimit"`
+	RuleListPath string  `mapstructure:"RuleListPath"`
 }
 
 // NodeStatus Node status
