@@ -8,16 +8,16 @@ require (
 	dario.cat/mergo v1.0.2
 	github.com/bitly/go-simplejson v0.5.1
 	github.com/deckarep/golang-set v1.8.0
-	github.com/eko/gocache/lib/v4 v4.1.6
+	github.com/eko/gocache/lib/v4 v4.2.0
 	github.com/eko/gocache/store/go_cache/v4 v4.2.5
-	github.com/eko/gocache/store/redis/v4 v4.2.1
+	github.com/eko/gocache/store/redis/v4 v4.2.6
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-acme/lego/v4 v4.16.1
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/gogf/gf/v2 v2.7.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/r3labs/diff/v2 v2.15.1
-	github.com/redis/go-redis/v9 v9.7.0
+	github.com/redis/go-redis/v9 v9.13.0
 	github.com/sagernet/sing v0.8.11
 	github.com/sagernet/sing-shadowsocks v0.2.7
 	github.com/shirou/gopsutil/v3 v3.24.5
@@ -121,7 +121,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
-	github.com/golang/mock v1.7.0-rc.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/gomarkdown/markdown v0.0.0-20231222211730-1d6d20845b47 // indirect
@@ -209,8 +208,8 @@ require (
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/pquerna/otp v1.4.0 // indirect
 	github.com/prometheus/client_golang v1.19.1 // indirect
-	github.com/prometheus/client_model v0.6.0 // indirect
-	github.com/prometheus/common v0.50.0 // indirect
+	github.com/prometheus/client_model v0.6.1 // indirect
+	github.com/prometheus/common v0.52.3 // indirect
 	github.com/prometheus/procfs v0.13.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af // indirect
@@ -265,6 +264,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.39.0 // indirect
 	go.opentelemetry.io/otel/trace v1.39.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
+	go.uber.org/mock v0.6.0 // indirect
 	go.uber.org/ratelimit v0.3.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
