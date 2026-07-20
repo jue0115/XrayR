@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.5
 
 require (
-	dario.cat/mergo v1.0.0
+	dario.cat/mergo v1.0.2
 	github.com/bitly/go-simplejson v0.5.1
 	github.com/deckarep/golang-set v1.8.0
 	github.com/eko/gocache/lib/v4 v4.1.6
@@ -302,4 +302,5 @@ require (
 )
 
 replace github.com/exoscale/egoscale => github.com/exoscale/egoscale v0.102.3
+
 replace github.com/xtls/xray-core => ./third_party/xray-core
