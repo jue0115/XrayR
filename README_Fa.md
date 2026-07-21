@@ -92,14 +92,3 @@ wget -N https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/ins
 
 [Mozilla Public License Version 2.0](https://github.com/XrayR-project/XrayR/blob/master/LICENSE)
 
-## Telgram
-
-[بحث در مورد XrayR Backend](https://t.me/XrayR_project)
-
-[کانال اعلان در مورد XrayR](https://t.me/XrayR_channel)
-
-## Stargazers over time
-
-[![Stargazers over time](https://starchart.cc/XrayR-project/XrayR.svg)](https://starchart.cc/XrayR-project/XrayR)
-
-
