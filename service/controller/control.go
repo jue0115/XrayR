@@ -147,6 +147,21 @@ func (c *Controller) DeleteInboundLimiter(tag string) error {
 	return err
 }
 
+// DeleteInboundLimiterUsers blocks the given users in the limiter so any
+// connection they established before removal is rejected on its next dispatch.
+func (c *Controller) DeleteInboundLimiterUsers(tag string, users []api.UserInfo) error {
+	return c.dispatcher.Limiter.DeleteUsers(tag, users)
+}
+
+// unregisterTraffic removes a user's traffic counters from the stats manager so
+// a re-added user cannot read stale accumulation as one huge delta.
+func (c *Controller) unregisterTraffic(email string) {
+	upName := "user>>>" + email + ">>>traffic>>>uplink"
+	downName := "user>>>" + email + ">>>traffic>>>downlink"
+	c.stm.UnregisterCounter(upName)
+	c.stm.UnregisterCounter(downName)
+}
+
 func (c *Controller) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	return c.dispatcher.Limiter.GetOnlineDevice(tag)
 }

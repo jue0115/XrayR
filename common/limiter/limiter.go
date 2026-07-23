@@ -34,6 +34,7 @@ type InboundInfo struct {
 	UserInfo       *sync.Map // Key: Email value: UserInfo
 	BucketHub      *sync.Map // key: Email, value: *rate.Limiter
 	UserOnlineIP   *sync.Map // Key: Email, value: {Key: IP, value: UID}
+	BlockedUsers   *sync.Map // Key: Email, value: struct{} — users removed by panel; reject their lingering connections
 	GlobalLimit    struct {
 		config         *GlobalDeviceLimitConfig
 		globalOnlineIP *marshaler.Marshaler
@@ -56,6 +57,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		NodeSpeedLimit: nodeSpeedLimit,
 		BucketHub:      new(sync.Map),
 		UserOnlineIP:   new(sync.Map),
+		BlockedUsers:   new(sync.Map),
 	}
 
 	if globalLimit != nil && globalLimit.Enable {
@@ -101,7 +103,12 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 		inboundInfo := value.(*InboundInfo)
 		// Update User info
 		for _, u := range *updatedUserList {
-			inboundInfo.UserInfo.Store(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID), UserInfo{
+			key := fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)
+			// A re-added user is no longer blocked.
+			if inboundInfo.BlockedUsers != nil {
+				inboundInfo.BlockedUsers.Delete(key)
+			}
+			inboundInfo.UserInfo.Store(key, UserInfo{
 				UID:         u.UID,
 				SpeedLimit:  u.SpeedLimit,
 				DeviceLimit: u.DeviceLimit,
@@ -109,14 +116,37 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 			// Update old limiter bucket
 			limit := determineRate(inboundInfo.NodeSpeedLimit, u.SpeedLimit)
 			if limit > 0 {
-				if bucket, ok := inboundInfo.BucketHub.Load(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)); ok {
+				if bucket, ok := inboundInfo.BucketHub.Load(key); ok {
 					limiter := bucket.(*rate.Limiter)
 					limiter.SetLimit(rate.Limit(limit))
 					limiter.SetBurst(int(limit))
 				}
 			} else {
-				inboundInfo.BucketHub.Delete(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID))
+				inboundInfo.BucketHub.Delete(key)
 			}
+		}
+	} else {
+		return fmt.Errorf("no such inbound in limiter: %s", tag)
+	}
+	return nil
+}
+
+// DeleteUsers removes the given users from an inbound's limiter state and marks
+// them blocked, so a connection established before removal is rejected on its
+// next dispatch and stops consuming traffic (instead of running for hours and
+// dumping one huge traffic report when the user is later re-added).
+func (l *Limiter) DeleteUsers(tag string, users []api.UserInfo) error {
+	if value, ok := l.InboundInfo.Load(tag); ok {
+		inboundInfo := value.(*InboundInfo)
+		if inboundInfo.BlockedUsers == nil {
+			inboundInfo.BlockedUsers = new(sync.Map)
+		}
+		for _, u := range users {
+			key := fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)
+			inboundInfo.UserInfo.Delete(key)
+			inboundInfo.BucketHub.Delete(key)
+			inboundInfo.UserOnlineIP.Delete(key)
+			inboundInfo.BlockedUsers.Store(key, struct{}{})
 		}
 	} else {
 		return fmt.Errorf("no such inbound in limiter: %s", tag)
@@ -171,6 +201,14 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		inboundInfo := value.(*InboundInfo)
 		nodeLimit := inboundInfo.NodeSpeedLimit
 
+		// Reject users removed by the panel: their auth is gone, but a connection
+		// established before removal would otherwise keep consuming traffic.
+		if inboundInfo.BlockedUsers != nil {
+			if _, blocked := inboundInfo.BlockedUsers.Load(email); blocked {
+				return nil, false, true
+			}
+		}
+
 		if v, ok := inboundInfo.UserInfo.Load(email); ok {
 			u := v.(UserInfo)
 			uid = u.UID
@@ -179,10 +217,19 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		}
 
 		// Local device limit
-		ipMap := new(sync.Map)
-		ipMap.Store(ip, uid)
-		// If any device is online
-		if v, ok := inboundInfo.UserOnlineIP.LoadOrStore(email, ipMap); ok {
+		// Fast path: reuse the user's existing online-IP map instead of
+		// allocating a throwaway sync.Map on every connection. Only allocate
+		// when the user is not online yet.
+		v, online := inboundInfo.UserOnlineIP.Load(email)
+		if !online {
+			ipMap := new(sync.Map)
+			ipMap.Store(ip, uid)
+			// LoadOrStore still resolves the race where two connections of a
+			// first-time-online user arrive concurrently.
+			v, online = inboundInfo.UserOnlineIP.LoadOrStore(email, ipMap)
+		}
+		// If any device is already online
+		if online {
 			ipMap := v.(*sync.Map)
 			// If this is a new ip
 			if _, ok := ipMap.LoadOrStore(ip, uid); !ok {
@@ -208,13 +255,15 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		// Speed limit
 		limit := determineRate(nodeLimit, userLimit) // Determine the speed limit rate
 		if limit > 0 {
-			limiter := rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
-			if v, ok := inboundInfo.BucketHub.LoadOrStore(email, limiter); ok {
-				bucket := v.(*rate.Limiter)
-				return bucket, true, false
-			} else {
-				return limiter, true, false
+			// Fast path: reuse the existing bucket instead of allocating a new
+			// rate.Limiter on every connection. The stored bucket is kept in sync
+			// with the current limit by UpdateInboundLimiter.
+			if v, ok := inboundInfo.BucketHub.Load(email); ok {
+				return v.(*rate.Limiter), true, false
 			}
+			limiter := rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
+			v, _ := inboundInfo.BucketHub.LoadOrStore(email, limiter)
+			return v.(*rate.Limiter), true, false
 		} else {
 			return nil, false, false
 		}

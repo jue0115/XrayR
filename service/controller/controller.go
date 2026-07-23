@@ -28,23 +28,24 @@ type LimitInfo struct {
 }
 
 type Controller struct {
-	server       *core.Instance
-	config       *Config
-	clientInfo   api.ClientInfo
-	apiClient    api.API
-	nodeInfo     *api.NodeInfo
-	Tag          string
-	userList     *[]api.UserInfo
-	tasks        []periodicTask
-	limitedUsers map[api.UserInfo]LimitInfo
-	warnedUsers  map[api.UserInfo]int
-	panelType    string
-	ibm          inbound.Manager
-	obm          outbound.Manager
-	stm          stats.Manager
-	dispatcher   *mydispatcher.DefaultDispatcher
-	startAt      time.Time
-	logger       *log.Entry
+	server        *core.Instance
+	config        *Config
+	clientInfo    api.ClientInfo
+	apiClient     api.API
+	nodeInfo      *api.NodeInfo
+	Tag           string
+	userList      *[]api.UserInfo
+	tasks         []periodicTask
+	limitedUsers  map[api.UserInfo]LimitInfo
+	warnedUsers   map[api.UserInfo]int
+	panelType     string
+	ibm           inbound.Manager
+	obm           outbound.Manager
+	stm           stats.Manager
+	dispatcher    *mydispatcher.DefaultDispatcher
+	startAt       time.Time
+	lastOnlineLog time.Time // throttle: last time the online-user count was logged
+	logger        *log.Entry
 }
 
 type periodicTask struct {
@@ -284,14 +285,24 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if usersChanged {
 			deleted, added = compareUserList(c.userList, newUserInfo)
 			if len(deleted) > 0 {
+				// 1. Block deleted users in the limiter first, so any connection
+				//    established before removal is rejected on its next dispatch
+				//    and stops consuming traffic (fixes the "ghost active user"
+				//    that keeps running for hours and later dumps one huge report).
+				if err := c.DeleteInboundLimiterUsers(c.Tag, deleted); err != nil {
+					c.logger.Print(err)
+				}
+				// 2. Remove from proxy auth (blocks new authentications).
 				deletedEmail := make([]string, len(deleted))
 				for i, u := range deleted {
 					deletedEmail[i] = fmt.Sprintf("%s|%s|%d", c.Tag, u.Email, u.UID)
 				}
-				err := c.removeUsers(deletedEmail, c.Tag)
-				if err != nil {
+				if err := c.removeUsers(deletedEmail, c.Tag); err != nil {
 					c.logger.Print(err)
 				}
+				// 3. Flush residual traffic: report what accumulated since the last
+				//    report, reset, and unregister the counters.
+				c.reportDeletedUserTraffic(deleted)
 			}
 			if len(added) > 0 {
 				err = c.addNewUser(&added, c.nodeInfo)
@@ -482,6 +493,45 @@ func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
 	*silentUsers = append(*silentUsers, user)
 }
 
+// reportDeletedUserTraffic flushes the residual traffic counters of users that
+// are being removed: it reports whatever they accumulated since the last report,
+// resets the counters on success, and unregisters them so a re-added user cannot
+// resurface stale accumulation as one huge delta.
+func (c *Controller) reportDeletedUserTraffic(deleted []api.UserInfo) {
+	var userTraffic []api.UserTraffic
+	var upCounterList []stats.Counter
+	var downCounterList []stats.Counter
+	for i := range deleted {
+		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&deleted[i]))
+		if up > 0 || down > 0 {
+			userTraffic = append(userTraffic, api.UserTraffic{
+				UID:      deleted[i].UID,
+				Email:    deleted[i].Email,
+				Upload:   up,
+				Download: down,
+			})
+			if upCounter != nil {
+				upCounterList = append(upCounterList, upCounter)
+			}
+			if downCounter != nil {
+				downCounterList = append(downCounterList, downCounter)
+			}
+		}
+	}
+	if len(userTraffic) > 0 && !c.config.DisableUploadTraffic {
+		if err := c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
+			c.logger.Print(err)
+		} else {
+			c.resetTraffic(&upCounterList, &downCounterList)
+		}
+	}
+	// Unregister counters regardless, so the stats manager keeps no stale counter
+	// that a re-added user would later read as one huge delta.
+	for i := range deleted {
+		c.unregisterTraffic(c.buildUserTag(&deleted[i]))
+	}
+}
+
 func (c *Controller) userInfoMonitor() (err error) {
 	// delay to start
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
@@ -593,7 +643,10 @@ func (c *Controller) userInfoMonitor() (err error) {
 		if err = c.apiClient.ReportNodeOnlineUsers(onlineDevice); err != nil {
 			c.logger.Print(err)
 		} else {
-			c.logger.Printf("Report %d online users", len(*onlineDevice))
+			if time.Since(c.lastOnlineLog) >= time.Hour {
+				c.lastOnlineLog = time.Now()
+				c.logger.Printf("Report %d online users", len(*onlineDevice))
+			}
 		}
 	}
 
