@@ -245,9 +245,9 @@ func (c *client) dial() error {
 	if quicParams.MaxIdleTimeout == 0 {
 		quicConfig.MaxIdleTimeout = 30 * time.Second
 	}
-	// if quicParams.KeepAlivePeriod == 0 {
-	// 	quicConfig.KeepAlivePeriod = 10 * time.Second
-	// }
+	if quicParams.KeepAlivePeriod == 0 {
+		quicConfig.KeepAlivePeriod = 10 * time.Second
+	}
 
 	var quicConn *quic.Conn
 	rt := &http3.Transport{
