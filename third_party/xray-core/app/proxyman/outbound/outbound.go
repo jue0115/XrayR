@@ -62,16 +62,21 @@ func (m *Manager) Start() error {
 // Close implements core.Feature
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-
 	m.running = false
+	taggedHandlers := m.taggedHandler
+	untaggedHandlers := m.untaggedHandlers
+	m.taggedHandler = make(map[string]outbound.Handler)
+	m.untaggedHandlers = nil
+	m.defaultHandler = nil
+	m.tagsCache = &sync.Map{}
+	m.access.Unlock()
 
 	var errs []error
-	for _, h := range m.taggedHandler {
+	for _, h := range taggedHandlers {
 		errs = append(errs, h.Close())
 	}
 
-	for _, h := range m.untaggedHandlers {
+	for _, h := range untaggedHandlers {
 		errs = append(errs, h.Close())
 	}
 
@@ -106,10 +111,6 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 
 	m.tagsCache = &sync.Map{}
 
-	if m.defaultHandler == nil {
-		m.defaultHandler = handler
-	}
-
 	tag := handler.Tag()
 	if len(tag) > 0 {
 		if _, found := m.taggedHandler[tag]; found {
@@ -119,9 +120,22 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 	} else {
 		m.untaggedHandlers = append(m.untaggedHandlers, handler)
 	}
+	previousDefault := m.defaultHandler
+	if m.defaultHandler == nil {
+		m.defaultHandler = handler
+	}
 
 	if m.running {
-		return handler.Start()
+		if err := handler.Start(); err != nil {
+			m.defaultHandler = previousDefault
+			if len(tag) > 0 {
+				delete(m.taggedHandler, tag)
+			} else {
+				m.untaggedHandlers = m.untaggedHandlers[:len(m.untaggedHandlers)-1]
+			}
+			_ = handler.Close()
+			return err
+		}
 	}
 
 	return nil
@@ -133,16 +147,28 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 		return common.ErrNoClue
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
 
 	m.tagsCache = &sync.Map{}
 
-	delete(m.taggedHandler, tag)
-	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
-		m.defaultHandler = nil
+	handler, found := m.taggedHandler[tag]
+	if !found {
+		m.access.Unlock()
+		return common.ErrNoClue
 	}
-
-	return nil
+	delete(m.taggedHandler, tag)
+	if m.defaultHandler == handler {
+		m.defaultHandler = nil
+		if len(m.untaggedHandlers) > 0 {
+			m.defaultHandler = m.untaggedHandlers[0]
+		} else {
+			for _, candidate := range m.taggedHandler {
+				m.defaultHandler = candidate
+				break
+			}
+		}
+	}
+	m.access.Unlock()
+	return handler.Close()
 }
 
 // ListHandlers implements outbound.Manager.

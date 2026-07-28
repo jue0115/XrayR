@@ -29,6 +29,7 @@ type ClassicNameServer struct {
 	requestsCleanup *task.Periodic
 	reqID           uint32
 	clientIP        net.IP
+	closed          atomic.Bool
 }
 
 type udpDnsRequest struct {
@@ -67,6 +68,20 @@ func (s *ClassicNameServer) Name() string {
 // IsDisableCache implements Server.
 func (s *ClassicNameServer) IsDisableCache() bool {
 	return s.cacheController.disableCache
+}
+
+func (s *ClassicNameServer) Close() error {
+	if s == nil || s.closed.Swap(true) {
+		return nil
+	}
+	_ = s.requestsCleanup.Close()
+	if s.udpServer != nil {
+		s.udpServer.RemoveRay()
+	}
+	s.Lock()
+	s.requests = make(map[uint16]*udpDnsRequest)
+	s.Unlock()
+	return s.cacheController.Close()
 }
 
 // RequestsCleanup clears expired items from cache
@@ -146,6 +161,9 @@ func (s *ClassicNameServer) newReqID() uint16 {
 }
 
 func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) {
+	if s.closed.Load() {
+		return
+	}
 	s.Lock()
 	id := req.msg.ID
 	req.expire = time.Now().Add(time.Second * 8)

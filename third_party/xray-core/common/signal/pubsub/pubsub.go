@@ -36,8 +36,27 @@ func (s *Subscriber) IsClosed() bool {
 
 type Service struct {
 	sync.RWMutex
-	subs  map[string][]*Subscriber
-	ctask *task.Periodic
+	subs   map[string][]*Subscriber
+	ctask  *task.Periodic
+	closed bool
+}
+
+// Close stops cleanup and releases all subscribers.
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.Lock()
+	defer s.Unlock()
+	s.closed = true
+	_ = s.ctask.Close()
+	for _, subscribers := range s.subs {
+		for _, subscriber := range subscribers {
+			_ = subscriber.Close()
+		}
+	}
+	s.subs = make(map[string][]*Subscriber)
+	return nil
 }
 
 func NewService() *Service {
@@ -87,6 +106,11 @@ func (s *Service) Subscribe(name string) *Subscriber {
 		done:   done.New(),
 	}
 	s.Lock()
+	if s.closed {
+		_ = sub.Close()
+		s.Unlock()
+		return sub
+	}
 	s.subs[name] = append(s.subs[name], sub)
 	s.Unlock()
 	common.Must(s.ctask.Start())

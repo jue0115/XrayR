@@ -5,12 +5,18 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
+)
+
+var (
+	keyLogAccess sync.Mutex
+	keyLogFiles  = make(map[string]*os.File)
 )
 
 func (c *Config) GetREALITYConfig() *reality.Config {
@@ -63,12 +69,36 @@ func KeyLogWriterFromConfig(c *Config) io.Writer {
 		return nil
 	}
 
+	keyLogAccess.Lock()
+	defer keyLogAccess.Unlock()
+	if writer := keyLogFiles[c.MasterKeyLog]; writer != nil {
+		return writer
+	}
 	writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
+		return nil
 	}
-
+	keyLogFiles[c.MasterKeyLog] = writer
 	return writer
+}
+
+func closeKeyLogWriters() error {
+	keyLogAccess.Lock()
+	writers := keyLogFiles
+	keyLogFiles = make(map[string]*os.File)
+	keyLogAccess.Unlock()
+	var errs []error
+	for _, writer := range writers {
+		if err := writer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
+}
+
+func init() {
+	internet.RegisterTransportDialerCloser(closeKeyLogWriters)
 }
 
 func ConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {

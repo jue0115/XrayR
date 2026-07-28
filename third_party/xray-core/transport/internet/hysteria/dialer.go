@@ -4,6 +4,7 @@ import (
 	"context"
 	go_tls "crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -118,9 +119,11 @@ type client struct {
 	conn           *quic.Conn
 	config         *Config
 	tlsConfig      *go_tls.Config
+	tlsSource      *tls.Config
 	socketConfig   *internet.SocketConfig
 	udpmaskManager *finalmask.UdpmaskManager
 	quicParams     *internet.QuicParams
+	lastUsed       time.Time
 
 	udpSM *udpSessionManagerClient
 	mutex sync.Mutex
@@ -139,8 +142,12 @@ func (c *client) status() Status {
 }
 
 func (c *client) close() {
-	_ = c.conn.CloseWithError(closeErrCodeOK, "")
-	_ = c.pktConn.Close()
+	if c.conn != nil {
+		_ = c.conn.CloseWithError(closeErrCodeOK, "")
+	}
+	if c.pktConn != nil {
+		_ = c.pktConn.Close()
+	}
 	c.pktConn = nil
 	c.conn = nil
 	c.udpSM = nil
@@ -382,6 +389,7 @@ func (c *client) setCtx(ctx context.Context) {
 	defer c.mutex.Unlock()
 
 	c.ctx = ctx
+	c.lastUsed = time.Now()
 }
 
 func (c *client) udphopDialer(addr *net.UDPAddr) (net.PacketConn, error) {
@@ -396,7 +404,6 @@ func (c *client) udphopDialer(addr *net.UDPAddr) (net.PacketConn, error) {
 	raw, err := internet.DialSystem(c.ctx, net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), c.socketConfig)
 	if err != nil {
 		errors.LogDebug(context.Background(), "skip hop: failed to dial to dest")
-		raw.Close()
 		return nil, errors.New()
 	}
 
@@ -421,17 +428,47 @@ func (c *client) udphopDialer(addr *net.UDPAddr) (net.PacketConn, error) {
 }
 
 type clientManager struct {
-	m     map[string]*client
-	mutex sync.Mutex
+	m         map[string]*client
+	mutex     sync.Mutex
+	lifecycle sync.Mutex
+	task      *task.Periodic
 }
 
 func (m *clientManager) clean() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	for _, c := range m.m {
-		c.clean()
+	for key, c := range m.m {
+		c.mutex.Lock()
+		status := c.status()
+		if status == StatusInactive || (status == StatusUnknown && time.Since(c.lastUsed) > time.Minute) {
+			c.close()
+			tls.StopCertificateWatchers(c.tlsSource)
+			delete(m.m, key)
+		}
+		c.mutex.Unlock()
 	}
+}
+
+func (m *clientManager) close() error {
+	m.lifecycle.Lock()
+	defer m.lifecycle.Unlock()
+	m.mutex.Lock()
+	t := m.task
+	m.task = nil
+	clients := m.m
+	m.m = make(map[string]*client)
+	m.mutex.Unlock()
+	if t != nil {
+		_ = t.Close()
+	}
+	for _, c := range clients {
+		c.mutex.Lock()
+		c.close()
+		tls.StopCertificateWatchers(c.tlsSource)
+		c.mutex.Unlock()
+	}
+	return nil
 }
 
 var manger *clientManager
@@ -444,10 +481,16 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	requireDatagram := hyCtx.RequireDatagramFromContext(ctx)
 	addr := dest.NetAddr()
+	// A stream settings instance represents one outbound configuration. Using
+	// it in the key prevents nodes sharing an address from reusing stale auth,
+	// TLS, socket or QUIC parameters after a reload.
+	clientKey := fmt.Sprintf("%s|%p", addr, streamSettings)
 	config := streamSettings.ProtocolSettings.(*Config)
 
+	manger.lifecycle.Lock()
+	defer manger.lifecycle.Unlock()
 	manger.mutex.Lock()
-	c, ok := manger.m[addr]
+	c, ok := manger.m[clientKey]
 	if !ok {
 		dest.Network = net.Network_UDP
 		c = &client{
@@ -455,14 +498,30 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			dest:           dest,
 			config:         config,
 			tlsConfig:      tlsConfig.GetTLSConfig(),
+			tlsSource:      tlsConfig,
 			socketConfig:   streamSettings.SocketSettings,
 			udpmaskManager: streamSettings.UdpmaskManager,
 			quicParams:     streamSettings.QuicParams,
+			lastUsed:       time.Now(),
 		}
-		manger.m[addr] = c
+		manger.m[clientKey] = c
 	}
 	c.setCtx(ctx)
+	startTask := false
+	if manger.task == nil {
+		manger.task = &task.Periodic{Interval: 30 * time.Second, Execute: func() error {
+			manger.clean()
+			return nil
+		}}
+		startTask = true
+	}
+	cleanupTask := manger.task
 	manger.mutex.Unlock()
+	if startTask {
+		if err := cleanupTask.Start(); err != nil {
+			return nil, err
+		}
+	}
 
 	if requireDatagram {
 		return c.udp()
@@ -474,13 +533,7 @@ func init() {
 	manger = &clientManager{
 		m: make(map[string]*client),
 	}
-	(&task.Periodic{
-		Interval: 30 * time.Second,
-		Execute: func() error {
-			manger.clean()
-			return nil
-		},
-	}).Start()
+	internet.RegisterTransportDialerCloser(manger.close)
 }
 
 func init() {

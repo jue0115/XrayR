@@ -206,7 +206,37 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
-	return nil
+	if s == nil {
+		return nil
+	}
+	s.Lock()
+	clients := s.clients
+	s.clients = nil
+	s.Unlock()
+	seen := make(map[Server]struct{})
+	var errs []error
+	for _, client := range clients {
+		if client == nil || client.server == nil {
+			continue
+		}
+		server := client.server
+		if _, ok := seen[server]; ok {
+			continue
+		}
+		seen[server] = struct{}{}
+		if closer, ok := server.(common.Closable); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		if cached, ok := server.(CachedNameserver); ok {
+			if err := cached.getCacheController().Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Combine(errs...)
 }
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier

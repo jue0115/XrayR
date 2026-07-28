@@ -16,10 +16,10 @@ import (
 
 // Manager manages all inbound handlers.
 type Manager struct {
-	access          sync.RWMutex
+	access           sync.RWMutex
 	untaggedHandlers []inbound.Handler
-	taggedHandlers  map[string]inbound.Handler
-	running         bool
+	taggedHandlers   map[string]inbound.Handler
+	running          bool
 }
 
 // New returns a new Manager for inbound handlers.
@@ -51,7 +51,15 @@ func (m *Manager) AddHandler(ctx context.Context, handler inbound.Handler) error
 	}
 
 	if m.running {
-		return handler.Start()
+		if err := handler.Start(); err != nil {
+			if len(tag) > 0 {
+				delete(m.taggedHandlers, tag)
+			} else {
+				m.untaggedHandlers = m.untaggedHandlers[:len(m.untaggedHandlers)-1]
+			}
+			_ = handler.Close()
+			return err
+		}
 	}
 
 	return nil
@@ -128,17 +136,20 @@ func (m *Manager) Start() error {
 // Close implements common.Closable.
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-
 	m.running = false
+	taggedHandlers := m.taggedHandlers
+	untaggedHandlers := m.untaggedHandlers
+	m.taggedHandlers = make(map[string]inbound.Handler)
+	m.untaggedHandlers = nil
+	m.access.Unlock()
 
 	var errs []interface{}
-	for _, handler := range m.taggedHandlers {
+	for _, handler := range taggedHandlers {
 		if err := handler.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	for _, handler := range m.untaggedHandlers {
+	for _, handler := range untaggedHandlers {
 		if err := handler.Close(); err != nil {
 			errs = append(errs, err)
 		}

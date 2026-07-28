@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,49 +32,66 @@ type TimeoutReader interface {
 type TimeoutWrapperReader struct {
 	Reader
 	stats.Counter
-	mb   MultiBuffer
-	err  error
-	done chan struct{}
+	access  sync.Mutex
+	pending chan timeoutReadResult
+}
+
+type timeoutReadResult struct {
+	buffer MultiBuffer
+	err    error
+}
+
+func (r *TimeoutWrapperReader) count(buffer MultiBuffer) {
+	if r.Counter != nil {
+		r.Counter.Add(int64(buffer.Len()))
+	}
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.done != nil {
-		<-r.done
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
-		}
-		return r.mb, r.err
+	r.access.Lock()
+	defer r.access.Unlock()
+
+	if r.pending != nil {
+		result := <-r.pending
+		r.pending = nil
+		r.count(result.buffer)
+		return result.buffer, result.err
 	}
-	r.mb, r.err = r.Reader.ReadMultiBuffer()
-	if r.Counter != nil {
-		r.Counter.Add(int64(r.mb.Len()))
-	}
-	return r.mb, r.err
+	buffer, err := r.Reader.ReadMultiBuffer()
+	r.count(buffer)
+	return buffer, err
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
-	if r.done == nil {
-		r.done = make(chan struct{})
-		go func() {
-			r.mb, r.err = r.Reader.ReadMultiBuffer()
-			close(r.done)
-		}()
-	}
-	timeout := make(chan struct{})
-	go func() {
-		time.Sleep(duration)
-		close(timeout)
-	}()
-	select {
-	case <-r.done:
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
+	r.access.Lock()
+	defer r.access.Unlock()
+
+	// Preserve native timeout behavior when the wrapped reader supports it.
+	// Pipe readers take this path, so no helper goroutine is created at all.
+	if r.pending == nil {
+		if timeoutReader, ok := r.Reader.(TimeoutReader); ok {
+			buffer, err := timeoutReader.ReadMultiBufferTimeout(duration)
+			r.count(buffer)
+			return buffer, err
 		}
-		return r.mb, r.err
-	case <-timeout:
-		return nil, nil
+
+		pending := make(chan timeoutReadResult, 1)
+		r.pending = pending
+		go func(results chan<- timeoutReadResult) {
+			buffer, err := r.Reader.ReadMultiBuffer()
+			results <- timeoutReadResult{buffer: buffer, err: err}
+		}(pending)
+	}
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case result := <-r.pending:
+		r.pending = nil
+		r.count(result.buffer)
+		return result.buffer, result.err
+	case <-timer.C:
+		return nil, ErrReadTimeout
 	}
 }
 

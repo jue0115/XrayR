@@ -262,10 +262,28 @@ func (s *Instance) Close() error {
 	s.running = false
 
 	var errs []interface{}
+	// Stop inbound handlers first so their tracked sessions no longer reference
+	// dispatchers, limiters or outbound handlers during teardown.
 	for _, f := range s.features {
+		if _, ok := f.(inbound.Manager); !ok {
+			continue
+		}
 		if err := f.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// Features are started in registration order, so close them in reverse.
+	for i := len(s.features) - 1; i >= 0; i-- {
+		f := s.features[i]
+		if _, ok := f.(inbound.Manager); ok {
+			continue
+		}
+		if err := f.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := internet.CloseTransportDialers(); err != nil {
+		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
 		return errors.New("failed to close all features").Base(errors.New(serial.Concat(errs...)))

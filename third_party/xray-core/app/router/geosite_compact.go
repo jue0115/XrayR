@@ -4,7 +4,6 @@ import (
 	"encoding/gob"
 	"errors"
 	"io"
-	"runtime"
 
 	"github.com/xtls/xray-core/common/strmatcher"
 )
@@ -88,7 +87,6 @@ func loadWithDeps(data *geoSiteListGob, code string, visited map[string]bool) (s
 	if len(matchers) == 1 {
 		return matchers[0], nil
 	}
-	runtime.GC()
 	return &strmatcher.IndexMatcherGroup{Matchers: matchers}, nil
 }
 func LoadGeoSiteHosts(r io.Reader) (map[string][]string, error) {

@@ -2,16 +2,24 @@ package ocsp
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"golang.org/x/crypto/ocsp"
 )
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+func CloseHTTPClient() {
+	httpClient.CloseIdleConnections()
+}
 
 func GetOCSPForFile(path string) ([]byte, error) {
 	return filesystem.ReadFile(path)
@@ -49,6 +57,10 @@ func GetOCSPStapling(cert [][]byte, path string) ([]byte, error) {
 }
 
 func GetOCSPForCert(cert [][]byte) ([]byte, error) {
+	return GetOCSPForCertContext(context.Background(), cert)
+}
+
+func GetOCSPForCertContext(ctx context.Context, cert [][]byte) ([]byte, error) {
 	bundle := new(bytes.Buffer)
 	for _, derBytes := range cert {
 		err := pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
@@ -70,13 +82,20 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, errors.New("no issuing certificate URL")
 		}
-		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
+		req, errC := http.NewRequestWithContext(ctx, http.MethodGet, issuedCert.IssuingCertificateURL[0], nil)
+		if errC != nil {
+			return nil, errors.New(errC)
+		}
+		resp, errC := httpClient.Do(req)
 		if errC != nil {
 			return nil, errors.New("no issuing certificate URL")
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, errors.New("issuer request returned ", resp.Status)
+		}
 
-		issuerBytes, errC := io.ReadAll(resp.Body)
+		issuerBytes, errC := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		if errC != nil {
 			return nil, errors.New(errC)
 		}
@@ -95,12 +114,20 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		return nil, err
 	}
 	reader := bytes.NewReader(ocspReq)
-	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, issuedCert.OCSPServer[0], reader)
 	if err != nil {
 		return nil, errors.New(err)
 	}
-	defer req.Body.Close()
-	ocspResBytes, err := io.ReadAll(req.Body)
+	httpReq.Header.Set("Content-Type", "application/ocsp-request")
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, errors.New("OCSP request returned ", resp.Status)
+	}
+	ocspResBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, errors.New(err)
 	}

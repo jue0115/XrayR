@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -34,6 +35,7 @@ type DoHNameServer struct {
 	httpClient      *http.Client
 	dohURL          string
 	clientIP        net.IP
+	closed          atomic.Bool
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
@@ -114,6 +116,16 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 // Name implements Server.
 func (s *DoHNameServer) Name() string {
 	return s.cacheController.name
+}
+
+func (s *DoHNameServer) Close() error {
+	if s == nil || s.closed.Swap(true) {
+		return nil
+	}
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
+	return s.cacheController.Close()
 }
 
 // IsDisableCache implements Server.
@@ -235,5 +247,8 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 
 // QueryIP implements Server.
 func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
+	if s.closed.Load() {
+		return nil, 0, errors.New("DNS-over-HTTPS client is closed")
+	}
 	return queryIP(ctx, s, domain, option)
 }

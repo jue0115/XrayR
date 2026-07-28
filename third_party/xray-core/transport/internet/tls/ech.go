@@ -116,6 +116,65 @@ var (
 	clientForECHDOH      = utils.NewTypedSyncMap[string, *http.Client]()
 )
 
+const maxGlobalECHCacheEntries = 2048
+const maxECHDoHClients = 64
+
+func pruneECHConfigCache() {
+	now := time.Now()
+	count := 0
+	GlobalECHConfigCache.Range(func(key string, cache *ECHConfigCache) bool {
+		record := cache.configRecord.Load()
+		if record != nil && !record.expire.IsZero() && record.expire.Before(now) {
+			GlobalECHConfigCache.Delete(key)
+			return true
+		}
+		count++
+		return true
+	})
+	if count < maxGlobalECHCacheEntries {
+		return
+	}
+	remove := count - maxGlobalECHCacheEntries + 1
+	GlobalECHConfigCache.Range(func(key string, _ *ECHConfigCache) bool {
+		GlobalECHConfigCache.Delete(key)
+		remove--
+		return remove > 0
+	})
+}
+
+// CloseECHCaches releases ECH records and DoH HTTP/2 connection pools.
+func CloseECHCaches() error {
+	clientForECHDOH.Range(func(_ string, client *http.Client) bool {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
+		return true
+	})
+	clientForECHDOH.Clear()
+	GlobalECHConfigCache.Clear()
+	return nil
+}
+
+func pruneECHDoHClients() {
+	count := 0
+	clientForECHDOH.Range(func(_ string, _ *http.Client) bool {
+		count++
+		return true
+	})
+	remove := count - maxECHDoHClients + 1
+	if remove <= 0 {
+		return
+	}
+	clientForECHDOH.Range(func(key string, client *http.Client) bool {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
+		clientForECHDOH.Delete(key)
+		remove--
+		return remove > 0
+	})
+}
+
 // sockopt can be nil if not specified.
 // if for clientForECHDOH, domain can be empty.
 func ECHCacheKey(server, domain string, sockopt *internet.SocketConfig) string {
@@ -161,6 +220,7 @@ func QueryRecord(domain string, server string, forceQuery string, sockopt *inter
 	GlobalECHConfigCacheKey := ECHCacheKey(server, domain, sockopt)
 	echConfigCache, ok := GlobalECHConfigCache.Load(GlobalECHConfigCacheKey)
 	if !ok {
+		pruneECHConfigCache()
 		echConfigCache = &ECHConfigCache{}
 		echConfigCache.configRecord.Store(&echConfigRecord{})
 		echConfigCache, _ = GlobalECHConfigCache.LoadOrStore(GlobalECHConfigCacheKey, echConfigCache)
@@ -188,6 +248,10 @@ func QueryRecord(domain string, server string, forceQuery string, sockopt *inter
 	}
 }
 
+func init() {
+	internet.RegisterTransportDialerCloser(CloseECHCaches)
+}
+
 // dnsQuery is the real func for sending type65 query for given domain to given DNS server.
 // return ECH config, TTL and error
 func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
@@ -211,6 +275,7 @@ func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]b
 		var client *http.Client
 		serverKey := ECHCacheKey(server, "", sockopt)
 		if client, _ = clientForECHDOH.Load(serverKey); client == nil {
+			pruneECHDoHClients()
 			// All traffic sent by core should via xray's internet.DialSystem
 			// This involves the behavior of some Android VPN GUI clients
 			tr := &http2.Transport{

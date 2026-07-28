@@ -5,8 +5,9 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"runtime"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,26 +78,49 @@ func run() error {
 	}
 	p := panel.New(panelConfig)
 	lastTime := time.Now()
+	var reloadAccess sync.Mutex
 	config.OnConfigChange(func(e fsnotify.Event) {
+		reloadAccess.Lock()
+		defer reloadAccess.Unlock()
 		// Discarding event received within a short period of time after receiving an event.
 		if time.Now().After(lastTime.Add(3 * time.Second)) {
 			// Hot reload function
 			fmt.Println("Config file changed:", e.Name)
-			p.Close()
-			// Delete old instance and trigger GC
-			runtime.GC()
-			if err := config.Unmarshal(panelConfig); err != nil {
-				log.Panicf("Parse config file %v failed: %s \n", cfgFile, err)
-			}
-			p.Start()
 			lastTime = time.Now()
+			nextConfig := &panel.Config{}
+			if err := config.Unmarshal(nextConfig); err != nil {
+				log.Printf("Ignore invalid hot reload configuration %v: %s", cfgFile, err)
+				return
+			}
+			next := panel.New(nextConfig)
+			old := p
+			if err := old.Close(); err != nil {
+				log.Printf("Old panel close reported errors: %s", err)
+			}
+			if err := next.Start(); err != nil {
+				log.Printf("Hot reload failed, restoring previous configuration: %s", err)
+				if rollbackErr := old.Start(); rollbackErr != nil {
+					log.Printf("Previous configuration rollback failed: %s", rollbackErr)
+				}
+				return
+			}
+			p = next
+			// The old core and its pools are now unreachable. Return free heap
+			// pages to the OS once instead of forcing periodic collections.
+			debug.FreeOSMemory()
 		}
 	})
-	p.Start()
-	defer p.Close()
+	if err := p.Start(); err != nil {
+		return err
+	}
+	defer func() {
+		if err := p.Close(); err != nil {
+			log.Printf("Panel close failed: %s", err)
+		}
+	}()
 
-	// Explicitly triggering GC to remove garbage from config loading.
-	runtime.GC()
+	// Release temporary allocations retained while loading the initial config.
+	debug.FreeOSMemory()
 	// Running backend
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM)

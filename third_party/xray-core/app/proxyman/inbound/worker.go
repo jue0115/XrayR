@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
+	v2tls "github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/udp"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -33,6 +34,59 @@ type worker interface {
 	Close() error
 	Port() net.Port
 	Proxy() proxy.Inbound
+}
+
+type connectionTracker struct {
+	access  sync.Mutex
+	closing bool
+	nextID  uint64
+	active  map[uint64]stat.Connection
+	wait    sync.WaitGroup
+}
+
+func (t *connectionTracker) add(conn stat.Connection) (uint64, bool) {
+	t.access.Lock()
+	defer t.access.Unlock()
+	if t.closing {
+		return 0, false
+	}
+	if t.active == nil {
+		t.active = make(map[uint64]stat.Connection)
+	}
+	t.nextID++
+	id := t.nextID
+	t.active[id] = conn
+	t.wait.Add(1)
+	return id, true
+}
+
+func (t *connectionTracker) remove(id uint64) {
+	t.access.Lock()
+	if _, found := t.active[id]; found {
+		delete(t.active, id)
+		t.wait.Done()
+	}
+	t.access.Unlock()
+}
+
+func (t *connectionTracker) stopAccepting() {
+	t.access.Lock()
+	t.closing = true
+	t.access.Unlock()
+}
+
+func (t *connectionTracker) closeAll() {
+	t.access.Lock()
+	connections := make([]stat.Connection, 0, len(t.active))
+	for _, conn := range t.active {
+		connections = append(connections, conn)
+	}
+	t.access.Unlock()
+
+	for _, conn := range connections {
+		common.Close(conn)
+	}
+	t.wait.Wait()
 }
 
 type tcpWorker struct {
@@ -47,7 +101,8 @@ type tcpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub         internet.Listener
+	connections connectionTracker
 
 	ctx context.Context
 }
@@ -60,7 +115,16 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 }
 
 func (w *tcpWorker) callback(conn stat.Connection) {
+	connectionID, accepted := w.connections.add(conn)
+	if !accepted {
+		common.Close(conn)
+		return
+	}
+	defer w.connections.remove(connectionID)
+	defer common.Close(conn)
+
 	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
@@ -92,8 +156,6 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 				}
 			}
 			if isLoopBack {
-				cancel()
-				conn.Close()
 				errors.LogError(ctx, errors.New("loopback connection detected"))
 				return
 			}
@@ -130,8 +192,6 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
 		errors.LogInfoInner(ctx, err, "connection ends")
 	}
-	cancel()
-	conn.Close()
 }
 
 func (w *tcpWorker) Proxy() proxy.Inbound {
@@ -151,6 +211,7 @@ func (w *tcpWorker) Start() error {
 		go w.callback(conn)
 	})
 	if err != nil {
+		v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
 	}
 	w.hub = hub
@@ -159,14 +220,17 @@ func (w *tcpWorker) Start() error {
 
 func (w *tcpWorker) Close() error {
 	var errs []interface{}
+	w.connections.stopAccepting()
 	if w.hub != nil {
 		if err := common.Close(w.hub); err != nil {
 			errs = append(errs, err)
 		}
-		if err := common.Close(w.proxy); err != nil {
-			errs = append(errs, err)
-		}
 	}
+	w.connections.closeAll()
+	if err := common.Close(w.proxy); err != nil {
+		errs = append(errs, err)
+	}
+	v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 	if len(errs) > 0 {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
 	}
@@ -188,12 +252,13 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	inactive         atomic.Bool
+	ctx              context.Context
 	cancel           context.CancelFunc
 }
 
 func (c *udpConn) setInactive() {
-	c.inactive = true
+	c.inactive.Store(true)
 }
 
 func (c *udpConn) updateActivity() {
@@ -281,6 +346,8 @@ type udpWorker struct {
 
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
+	activeWait sync.WaitGroup
+	closing    bool
 
 	ctx  context.Context
 	cone bool
@@ -289,6 +356,9 @@ type udpWorker struct {
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	w.Lock()
 	defer w.Unlock()
+	if w.closing {
+		return nil, false
+	}
 
 	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
 		conn.updateActivity()
@@ -296,6 +366,7 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	}
 
 	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))
+	ctx, cancel := context.WithCancel(w.ctx)
 	conn := &udpConn{
 		reader: pReader,
 		writer: pWriter,
@@ -313,8 +384,11 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		done:     done.New(),
 		uplink:   w.uplinkCounter,
 		downlink: w.downlinkCounter,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	w.activeConn[id] = conn
+	w.activeWait.Add(1)
 
 	conn.updateActivity()
 	return conn, false
@@ -331,6 +405,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		b.UDP = &originalDest
 	}
 	conn, existing := w.getConnection(id)
+	if conn == nil {
+		b.Release()
+		return
+	}
 
 	// payload will be discarded in pipe is full.
 	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
@@ -339,8 +417,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		common.Must(w.checker.Start())
 
 		go func() {
-			ctx, cancel := context.WithCancel(w.ctx)
-			conn.cancel = cancel
+			defer w.activeWait.Done()
+			ctx := conn.ctx
 			sid := session.NewID()
 			ctx = c.ContextWithID(ctx, sid)
 
@@ -378,7 +456,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			}
 			conn.Close()
 			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				w.removeConn(id)
 			}
@@ -410,7 +488,7 @@ func (w *udpWorker) clean() error {
 
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				delete(w.activeConn, addr)
 			}
@@ -426,10 +504,14 @@ func (w *udpWorker) clean() error {
 }
 
 func (w *udpWorker) Start() error {
+	w.Lock()
 	w.activeConn = make(map[connID]*udpConn, 16)
+	w.closing = false
+	w.Unlock()
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
+		v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 		return err
 	}
 
@@ -447,7 +529,14 @@ func (w *udpWorker) Start() error {
 
 func (w *udpWorker) Close() error {
 	w.Lock()
-	defer w.Unlock()
+	w.closing = true
+	connections := make([]*udpConn, 0, len(w.activeConn))
+	for id, conn := range w.activeConn {
+		conn.setInactive()
+		connections = append(connections, conn)
+		delete(w.activeConn, id)
+	}
+	w.Unlock()
 
 	var errs []interface{}
 
@@ -462,10 +551,17 @@ func (w *udpWorker) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, conn := range connections {
+		if err := common.Close(conn); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	w.activeWait.Wait()
 
 	if err := common.Close(w.proxy); err != nil {
 		errs = append(errs, err)
 	}
+	v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 
 	if len(errs) > 0 {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
@@ -491,13 +587,23 @@ type dsWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub         internet.Listener
+	connections connectionTracker
 
 	ctx context.Context
 }
 
 func (w *dsWorker) callback(conn stat.Connection) {
+	connectionID, accepted := w.connections.add(conn)
+	if !accepted {
+		common.Close(conn)
+		return
+	}
+	defer w.connections.remove(connectionID)
+	defer common.Close(conn)
+
 	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
@@ -529,10 +635,6 @@ func (w *dsWorker) callback(conn stat.Connection) {
 	if err := w.proxy.Process(ctx, net.Network_UNIX, conn, w.dispatcher); err != nil {
 		errors.LogInfoInner(ctx, err, "connection ends")
 	}
-	cancel()
-	if err := conn.Close(); err != nil {
-		errors.LogInfoInner(ctx, err, "failed to close connection")
-	}
 }
 
 func (w *dsWorker) Proxy() proxy.Inbound {
@@ -549,6 +651,7 @@ func (w *dsWorker) Start() error {
 		go w.callback(conn)
 	})
 	if err != nil {
+		v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
 	}
 	w.hub = hub
@@ -557,14 +660,17 @@ func (w *dsWorker) Start() error {
 
 func (w *dsWorker) Close() error {
 	var errs []interface{}
+	w.connections.stopAccepting()
 	if w.hub != nil {
 		if err := common.Close(w.hub); err != nil {
 			errs = append(errs, err)
 		}
-		if err := common.Close(w.proxy); err != nil {
-			errs = append(errs, err)
-		}
 	}
+	w.connections.closeAll()
+	if err := common.Close(w.proxy); err != nil {
+		errs = append(errs, err)
+	}
+	v2tls.StopCertificateWatchers(v2tls.ConfigFromStreamSettings(w.stream))
 	if len(errs) > 0 {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
 	}

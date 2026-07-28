@@ -171,6 +171,10 @@ func (c *Controller) UpdateRule(tag string, newRuleList []api.DetectRule) error 
 	return err
 }
 
+func (c *Controller) DeleteRule(tag string) {
+	c.dispatcher.RuleManager.DeleteRule(tag)
+}
+
 func (c *Controller) GetDetectResult(tag string) (*[]api.DetectResult, error) {
 	return c.dispatcher.RuleManager.GetDetectResult(tag)
 }

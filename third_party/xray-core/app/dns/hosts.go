@@ -2,7 +2,6 @@ package dns
 
 import (
 	"context"
-	"runtime"
 	"strconv"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -25,7 +24,6 @@ func NewStaticHosts(hosts []*Config_HostMapping) (*StaticHosts, error) {
 		matchers: g,
 	}
 
-	defer runtime.GC()
 	for i, mapping := range hosts {
 		hosts[i] = nil
 		matcher, err := toStrMatcher(mapping.Type, mapping.Domain)

@@ -24,14 +24,14 @@ type XmuxClient struct {
 }
 
 type XmuxManager struct {
-	xmuxConfig  XmuxConfig
+	xmuxConfig  *XmuxConfig
 	concurrency int32
 	connections int32
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
 }
 
-func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
 	return &XmuxManager{
 		xmuxConfig:  xmuxConfig,
 		concurrency: xmuxConfig.GetNormalizedMaxConcurrency().rand(),
@@ -110,4 +110,18 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 		xmuxClient.leftUsage -= 1
 	}
 	return xmuxClient
+}
+
+// Close releases every transport client retained by this XMUX manager.
+func (m *XmuxManager) Close() error {
+	var errs []error
+	for _, client := range m.xmuxClients {
+		if closer, ok := client.XmuxConn.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	m.xmuxClients = nil
+	return errors.Combine(errs...)
 }

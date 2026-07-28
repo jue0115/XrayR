@@ -27,6 +27,14 @@ type ClientManager struct {
 	Picker  WorkerPicker
 }
 
+// Close releases all mux workers and the picker's cleanup task.
+func (m *ClientManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	return common.Close(m.Picker)
+}
+
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
 	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
@@ -48,9 +56,11 @@ type WorkerPicker interface {
 type IncrementalWorkerPicker struct {
 	Factory ClientWorkerFactory
 
+	lifecycle   sync.Mutex
 	access      sync.Mutex
 	workers     []*ClientWorker
 	cleanupTask *task.Periodic
+	closed      bool
 }
 
 func (p *IncrementalWorkerPicker) cleanupFunc() error {
@@ -88,6 +98,9 @@ func (p *IncrementalWorkerPicker) findAvailable() int {
 func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 	p.access.Lock()
 	defer p.access.Unlock()
+	if p.closed {
+		return nil, false, errors.New("mux worker picker is closed")
+	}
 
 	idx := p.findAvailable()
 	if idx >= 0 {
@@ -116,9 +129,44 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 	return worker, true, nil
 }
 
+// Close stops background cleanup and closes every active mux worker.
+func (p *IncrementalWorkerPicker) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		return nil
+	}
+	p.closed = true
+	cleanupTask := p.cleanupTask
+	p.cleanupTask = nil
+	workers := p.workers
+	p.workers = nil
+	p.access.Unlock()
+
+	var errs []error
+	if cleanupTask != nil {
+		if err := cleanupTask.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, worker := range workers {
+		if err := worker.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
+}
+
 func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
 	worker, start, err := p.pickInternal()
-	if start {
+	if start && err == nil {
 		common.Must(p.cleanupTask.Start())
 	}
 

@@ -10,8 +10,8 @@ import (
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -36,6 +36,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+	internet.RegisterTransportDialerCloser(CloseGlobalDialers)
 }
 
 type dialerConf struct {
@@ -47,6 +48,26 @@ var (
 	globalDialerMap    map[dialerConf]*grpc.ClientConn
 	globalDialerAccess sync.Mutex
 )
+
+// CloseGlobalDialers closes cached gRPC clients and releases their TLS
+// certificate watchers. It is safe to call more than once.
+func CloseGlobalDialers() error {
+	globalDialerAccess.Lock()
+	dialers := globalDialerMap
+	globalDialerMap = nil
+	globalDialerAccess.Unlock()
+
+	var errs []error
+	for key, client := range dialers {
+		if client != nil {
+			if err := client.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		tls.StopCertificateWatchers(tls.ConfigFromStreamSettings(key.MemoryStreamConfig))
+	}
+	return errors.Combine(errs...)
+}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -205,7 +226,9 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		setUserAgent(conn, userAgent)
 		conn.Connect()
 	}
-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
+	if conn != nil {
+		globalDialerMap[dialerConf{dest, streamSettings}] = conn
+	}
 	return conn, err
 }
 

@@ -5,6 +5,7 @@ import (
 	go_errors "errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -38,6 +39,7 @@ type CacheController struct {
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
+	closed        atomic.Bool
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -55,6 +57,23 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		Execute:  c.CacheCleanup,
 	}
 	return c
+}
+
+// Close stops cache maintenance and releases records and subscribers.
+func (c *CacheController) Close() error {
+	if c == nil || c.closed.Swap(true) {
+		return nil
+	}
+	_ = c.cacheCleanup.Close()
+	if c.pub != nil {
+		_ = c.pub.Close()
+	}
+	c.Lock()
+	c.ips = make(map[string]*record)
+	c.dirtyips = nil
+	c.highWatermark = 0
+	c.Unlock()
+	return nil
 }
 
 // CacheCleanup clears expired items from cache
@@ -242,6 +261,9 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
+	if c.closed.Load() {
+		return
+	}
 	rtt := time.Since(req.start)
 
 	switch req.reqType {

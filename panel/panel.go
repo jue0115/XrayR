@@ -2,6 +2,8 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 
@@ -159,17 +161,38 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	return server
 }
 
-// Start the panel
-func (p *Panel) Start() {
+// Start starts the panel and rolls back all resources created before an error.
+func (p *Panel) Start() (err error) {
 	p.access.Lock()
 	defer p.access.Unlock()
+	if p.Running {
+		return nil
+	}
+	var server *core.Instance
+	var services []service.Service
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panel start failed: %v", recovered)
+		}
+		if err == nil {
+			return
+		}
+		for i := len(services) - 1; i >= 0; i-- {
+			_ = services[i].Close()
+		}
+		if server != nil {
+			_ = server.Close()
+		}
+		p.Service = nil
+		p.Server = nil
+		p.Running = false
+	}()
 	log.Print("Start the panel..")
 	// Load Core
-	server := p.loadCore(p.panelConfig)
+	server = p.loadCore(p.panelConfig)
 	if err := server.Start(); err != nil {
-		log.Panicf("Failed to start instance: %s", err)
+		return fmt.Errorf("start core: %w", err)
 	}
-	p.Server = server
 
 	// Load Nodes config
 	for _, nodeConfig := range p.panelConfig.NodesConfig {
@@ -201,35 +224,41 @@ func (p *Panel) Start() {
 			}
 		}
 		controllerService = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
-		p.Service = append(p.Service, controllerService)
+		services = append(services, controllerService)
 
 	}
 
 	// Start all the service
-	for _, s := range p.Service {
-		err := s.Start()
-		if err != nil {
-			log.Panicf("Panel Start failed: %s", err)
+	for _, s := range services {
+		if err := s.Start(); err != nil {
+			return fmt.Errorf("start controller: %w", err)
 		}
 	}
+	p.Server = server
+	p.Service = services
 	p.Running = true
-	return
+	return nil
 }
 
 // Close the panel
-func (p *Panel) Close() {
+func (p *Panel) Close() error {
 	p.access.Lock()
 	defer p.access.Unlock()
-	for _, s := range p.Service {
-		err := s.Close()
-		if err != nil {
-			log.Panicf("Panel Close failed: %s", err)
+	var closeErrs []error
+	for i := len(p.Service) - 1; i >= 0; i-- {
+		if err := p.Service[i].Close(); err != nil {
+			closeErrs = append(closeErrs, err)
 		}
 	}
 	p.Service = nil
-	p.Server.Close()
+	if p.Server != nil {
+		if err := p.Server.Close(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+		p.Server = nil
+	}
 	p.Running = false
-	return
+	return errors.Join(closeErrs...)
 }
 
 func parseConnectionConfig(c *ConnectionConfig) (policy *conf.Policy) {

@@ -44,6 +44,13 @@ type APIClient struct {
 	eTags            map[string]string
 }
 
+func (c *APIClient) Close() error {
+	if c != nil && c.client != nil {
+		c.client.GetClient().CloseIdleConnections()
+	}
+	return nil
+}
+
 // New create api instance
 func New(apiConfig *api.Config) *APIClient {
 	client := resty.New()
@@ -93,31 +100,30 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 	if path != "" {
 		// open the file
 		file, err := os.Open(path)
-
-		defer func(file *os.File) {
-			err := file.Close()
-			if err != nil {
-				log.Printf("Error when closing file: %s", err)
-			}
-		}(file)
 		// handle errors while opening
 		if err != nil {
 			log.Printf("Error when opening file: %s", err)
 			return LocalRuleList
 		}
+		defer file.Close()
 
 		fileScanner := bufio.NewScanner(file)
 
 		// read line by line
 		for fileScanner.Scan() {
+			pattern, err := regexp.Compile(fileScanner.Text())
+			if err != nil {
+				log.Printf("Ignore invalid local rule %q: %s", fileScanner.Text(), err)
+				continue
+			}
 			LocalRuleList = append(LocalRuleList, api.DetectRule{
 				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
+				Pattern: pattern,
 			})
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
-			log.Fatalf("Error while reading file: %s", err)
+			log.Printf("Error while reading file: %s", err)
 			return
 		}
 	}
@@ -144,7 +150,7 @@ func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (
 		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
 
-	if res.StatusCode() > 400 {
+	if res.StatusCode() >= 400 {
 		body := res.Body()
 		return nil, fmt.Errorf("request %s failed: %s, %v", c.assembleURL(path), string(body), err)
 	}
@@ -820,4 +826,3 @@ func (c *APIClient) ParseHysteriaNodeResponse(nodeInfoResponse *NodeInfoResponse
 
 	return nodeInfo, nil
 }
-

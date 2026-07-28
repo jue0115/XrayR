@@ -33,6 +33,7 @@ type QUICNameServer struct {
 	destination     *net.Destination
 	connection      *quic.Conn
 	clientIP        net.IP
+	closed          bool
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -65,6 +66,25 @@ func (s *QUICNameServer) Name() string {
 // IsDisableCache implements Server.
 func (s *QUICNameServer) IsDisableCache() bool {
 	return s.cacheController.disableCache
+}
+
+func (s *QUICNameServer) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.Lock()
+	if s.closed {
+		s.Unlock()
+		return nil
+	}
+	s.closed = true
+	conn := s.connection
+	s.connection = nil
+	s.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "dns client closed")
+	}
+	return s.cacheController.Close()
 }
 
 func (s *QUICNameServer) newReqID() uint16 {
@@ -227,6 +247,12 @@ func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
 
 	s.Lock()
 	defer s.Unlock()
+	if s.closed {
+		return nil, errors.New("DNS-over-QUIC client is closed")
+	}
+	if s.connection != nil && isActive(s.connection) {
+		return s.connection, nil
+	}
 
 	var err error
 	conn, err = s.openConnection()

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -46,6 +48,10 @@ type Controller struct {
 	startAt       time.Time
 	lastOnlineLog time.Time // throttle: last time the online-user count was logged
 	logger        *log.Entry
+	monitorAccess sync.Mutex
+	taskState     sync.Mutex
+	taskWG        sync.WaitGroup
+	closing       atomic.Bool
 }
 
 type periodicTask struct {
@@ -61,23 +67,27 @@ func New(server *core.Instance, api api.API, config *Config, panelType string) *
 		"ID":   api.Describe().NodeID,
 	})
 	controller := &Controller{
-		server:     server,
-		config:     config,
-		apiClient:  api,
-		panelType:  panelType,
-		ibm:        server.GetFeature(inbound.ManagerType()).(inbound.Manager),
-		obm:        server.GetFeature(outbound.ManagerType()).(outbound.Manager),
-		stm:        server.GetFeature(stats.ManagerType()).(stats.Manager),
-		dispatcher: server.GetFeature(routing.DispatcherType()).(*mydispatcher.DefaultDispatcher),
-		startAt:    time.Now(),
-		logger:     logger,
+		server:    server,
+		config:    config,
+		apiClient: api,
+		panelType: panelType,
+		startAt:   time.Now(),
+		logger:    logger,
 	}
+	controller.ibm, _ = server.GetFeature(inbound.ManagerType()).(inbound.Manager)
+	controller.obm, _ = server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+	controller.stm, _ = server.GetFeature(stats.ManagerType()).(stats.Manager)
+	controller.dispatcher, _ = server.GetFeature(routing.DispatcherType()).(*mydispatcher.DefaultDispatcher)
 
 	return controller
 }
 
 // Start implement the Start() function of the service interface
 func (c *Controller) Start() error {
+	if c.ibm == nil || c.obm == nil || c.stm == nil || c.dispatcher == nil {
+		return errors.New("core is missing the XrayR inbound, outbound, stats, or dispatcher feature")
+	}
+	c.closing.Store(false)
 	c.clientInfo = c.apiClient.Describe()
 	// First fetch Node Info
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
@@ -119,7 +129,10 @@ func (c *Controller) Start() error {
 	if !c.config.DisableGetRule {
 		if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
 			c.logger.Printf("Get rule list filed: %s", err)
-		} else if len(*ruleList) > 0 {
+		} else {
+			if ruleList == nil {
+				return errors.New("panel returned a nil rule list")
+			}
 			if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
 				c.logger.Print(err)
 			}
@@ -141,13 +154,13 @@ func (c *Controller) Start() error {
 			tag: "node monitor",
 			Periodic: &task.Periodic{
 				Interval: time.Duration(c.config.UpdatePeriodic) * time.Second,
-				Execute:  c.nodeInfoMonitor,
+				Execute:  func() error { return c.runPeriodic(c.nodeInfoMonitor) },
 			}},
 		periodicTask{
 			tag: "user monitor",
 			Periodic: &task.Periodic{
 				Interval: time.Duration(c.config.UpdatePeriodic) * time.Second,
-				Execute:  c.userInfoMonitor,
+				Execute:  func() error { return c.runPeriodic(c.userInfoMonitor) },
 			}},
 	)
 
@@ -157,14 +170,16 @@ func (c *Controller) Start() error {
 			tag: "cert monitor",
 			Periodic: &task.Periodic{
 				Interval: time.Duration(c.config.UpdatePeriodic) * time.Second * 60,
-				Execute:  c.certMonitor,
+				Execute:  func() error { return c.runPeriodic(c.certMonitor) },
 			}})
 	}
 
 	// Start periodic tasks
 	for i := range c.tasks {
 		c.logger.Printf("Start %s periodic task", c.tasks[i].tag)
-		go c.tasks[i].Start()
+		if err := c.tasks[i].Start(); err != nil {
+			return fmt.Errorf("start %s periodic task: %w", c.tasks[i].tag, err)
+		}
 	}
 
 	return nil
@@ -172,15 +187,46 @@ func (c *Controller) Start() error {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	c.taskState.Lock()
+	c.closing.Store(true)
+	c.taskState.Unlock()
+
+	var closeErrs []error
 	for i := range c.tasks {
 		if c.tasks[i].Periodic != nil {
 			if err := c.tasks[i].Periodic.Close(); err != nil {
-				c.logger.Panicf("%s periodic task close failed: %s", c.tasks[i].tag, err)
+				closeErrs = append(closeErrs, fmt.Errorf("%s periodic task: %w", c.tasks[i].tag, err))
 			}
 		}
 	}
+	c.taskWG.Wait()
+	c.tasks = nil
+	if closer, ok := c.apiClient.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+	}
+	return errors.Join(closeErrs...)
+}
 
-	return nil
+func (c *Controller) runPeriodic(execute func() error) error {
+	c.taskState.Lock()
+	if c.closing.Load() {
+		c.taskState.Unlock()
+		return nil
+	}
+	c.taskWG.Add(1)
+	c.taskState.Unlock()
+	defer c.taskWG.Done()
+
+	// Node, user and certificate refreshes all mutate controller/Core state.
+	// Execute them serially so a slow panel request cannot overlap another task.
+	c.monitorAccess.Lock()
+	defer c.monitorAccess.Unlock()
+	if c.closing.Load() {
+		return nil
+	}
+	return execute()
 }
 
 func (c *Controller) nodeInfoMonitor() (err error) {
@@ -217,67 +263,65 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			return nil
 		}
 	}
+	var replacedOldTag string
+	var replacedOldNodeInfo *api.NodeInfo
 
 	// If nodeInfo changed
 	if nodeInfoChanged {
 		if !reflect.DeepEqual(c.nodeInfo, newNodeInfo) {
 			// Remove old tag
 			oldTag := c.Tag
-			err := c.removeOldTag(oldTag)
-			if err != nil {
-				c.logger.Print(err)
-				return nil
+			oldNodeInfo := c.nodeInfo
+			// Flush and unregister all counters while the old tag is still active.
+			if c.userList != nil {
+				c.reportDeletedUserTraffic(*c.userList)
 			}
-			if c.nodeInfo.NodeType == "Shadowsocks-Plugin" {
-				err = c.removeOldTag(fmt.Sprintf("dokodemo-door_%s+1", c.Tag))
-			}
+			err := c.removeNodeHandlers(oldTag, oldNodeInfo)
 			if err != nil {
-				c.logger.Print(err)
-				return nil
+				c.logger.Printf("old node handlers reported close errors: %s", err)
 			}
 			// Add new tag
 			c.nodeInfo = newNodeInfo
 			c.Tag = c.buildNodeTag()
 			err = c.addNewTag(newNodeInfo)
 			if err != nil {
-				c.logger.Print(err)
+				failedTag := c.Tag
+				c.nodeInfo = oldNodeInfo
+				c.Tag = oldTag
+				if rollbackErr := c.addNewTag(oldNodeInfo); rollbackErr != nil {
+					c.logger.Printf("add new tag %s failed: %s; rollback %s failed: %s", failedTag, err, oldTag, rollbackErr)
+				} else if c.userList != nil {
+					if rollbackErr := c.addNewUser(c.userList, oldNodeInfo); rollbackErr != nil {
+						c.logger.Printf("restore users for %s failed: %s", oldTag, rollbackErr)
+					}
+				}
 				return nil
 			}
 			nodeInfoChanged = true
-			// Remove Old limiter
-			if err = c.DeleteInboundLimiter(oldTag); err != nil {
-				c.logger.Print(err)
-				return nil
-			}
+			replacedOldTag = oldTag
+			replacedOldNodeInfo = oldNodeInfo
 		} else {
 			nodeInfoChanged = false
-		}
-	}
-
-	// Check Rule
-	if !c.config.DisableGetRule {
-		if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
-			if err.Error() != api.RuleNotModified {
-				c.logger.Printf("Get rule list filed: %s", err)
-			}
-		} else if len(*ruleList) > 0 {
-			if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
-				c.logger.Print(err)
-			}
 		}
 	}
 
 	if nodeInfoChanged {
 		err = c.addNewUser(newUserInfo, newNodeInfo)
 		if err != nil {
-			c.logger.Print(err)
+			c.rollbackNodeReplacement(replacedOldTag, replacedOldNodeInfo, newNodeInfo, err)
 			return nil
 		}
 
 		// Add Limiter
 		if err := c.AddInboundLimiter(c.Tag, newNodeInfo.SpeedLimit, newUserInfo, c.config.GlobalDeviceLimitConfig); err != nil {
-			c.logger.Print(err)
+			c.rollbackNodeReplacement(replacedOldTag, replacedOldNodeInfo, newNodeInfo, err)
 			return nil
+		}
+		if replacedOldTag != "" && replacedOldTag != c.Tag {
+			c.DeleteRule(replacedOldTag)
+			if err := c.DeleteInboundLimiter(replacedOldTag); err != nil {
+				c.logger.Print(err)
+			}
 		}
 
 	} else {
@@ -319,20 +363,57 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
 		}
 	}
+
+	// Fetch rules only after a node replacement has committed, so rollback
+	// never leaves the restored tag with rules from the failed configuration.
+	if !c.config.DisableGetRule {
+		if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
+			if err.Error() != api.RuleNotModified {
+				c.logger.Printf("Get rule list filed: %s", err)
+			}
+		} else if ruleList == nil {
+			c.logger.Print("panel returned a nil rule list")
+		} else if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
+			c.logger.Print(err)
+		}
+	}
 	c.userList = newUserInfo
 	return nil
 }
 
+func (c *Controller) removeNodeHandlers(tag string, nodeInfo *api.NodeInfo) error {
+	var removeErrs []error
+	if err := c.removeOldTag(tag); err != nil {
+		removeErrs = append(removeErrs, err)
+	}
+	if nodeInfo != nil && nodeInfo.NodeType == "Shadowsocks-Plugin" {
+		if err := c.removeOldTag(fmt.Sprintf("dokodemo-door_%s+1", tag)); err != nil {
+			removeErrs = append(removeErrs, err)
+		}
+	}
+	return errors.Join(removeErrs...)
+}
+
+func (c *Controller) rollbackNodeReplacement(oldTag string, oldNodeInfo, failedNodeInfo *api.NodeInfo, cause error) {
+	failedTag := c.Tag
+	_ = c.removeNodeHandlers(failedTag, failedNodeInfo)
+	c.nodeInfo = oldNodeInfo
+	c.Tag = oldTag
+	if rollbackErr := c.addNewTag(oldNodeInfo); rollbackErr != nil {
+		c.logger.Printf("node replacement %s failed: %s; rollback %s failed: %s", failedTag, cause, oldTag, rollbackErr)
+		return
+	}
+	if c.userList != nil {
+		if rollbackErr := c.addNewUser(c.userList, oldNodeInfo); rollbackErr != nil {
+			c.logger.Printf("restore users for %s failed: %s", oldTag, rollbackErr)
+		}
+	}
+}
+
 func (c *Controller) removeOldTag(oldTag string) (err error) {
-	err = c.removeInbound(oldTag)
-	if err != nil {
-		return err
-	}
-	err = c.removeOutbound(oldTag)
-	if err != nil {
-		return err
-	}
-	return nil
+	inboundErr := c.removeInbound(oldTag)
+	outboundErr := c.removeOutbound(oldTag)
+	return errors.Join(inboundErr, outboundErr)
 }
 
 func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
@@ -348,12 +429,12 @@ func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
 		}
 		outBoundConfig, err := OutboundBuilder(c.config, newNodeInfo, c.Tag)
 		if err != nil {
-
+			_ = c.removeInbound(c.Tag)
 			return err
 		}
 		err = c.addOutbound(outBoundConfig)
 		if err != nil {
-
+			_ = c.removeInbound(c.Tag)
 			return err
 		}
 
@@ -364,6 +445,26 @@ func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
 }
 
 func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error) {
+	dokodemoTag := fmt.Sprintf("dokodemo-door_%s+1", c.Tag)
+	baseInboundAdded, baseOutboundAdded := false, false
+	dokodemoInboundAdded, dokodemoOutboundAdded := false, false
+	defer func() {
+		if err == nil {
+			return
+		}
+		if dokodemoOutboundAdded {
+			_ = c.removeOutbound(dokodemoTag)
+		}
+		if dokodemoInboundAdded {
+			_ = c.removeInbound(dokodemoTag)
+		}
+		if baseOutboundAdded {
+			_ = c.removeOutbound(c.Tag)
+		}
+		if baseInboundAdded {
+			_ = c.removeInbound(c.Tag)
+		}
+	}()
 	// Shadowsocks-Plugin require a separate inbound for other TransportProtocol likes: ws, grpc
 	fakeNodeInfo := newNodeInfo
 	fakeNodeInfo.TransportProtocol = "tcp"
@@ -378,6 +479,7 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
+	baseInboundAdded = true
 	outBoundConfig, err := OutboundBuilder(c.config, &fakeNodeInfo, c.Tag)
 	if err != nil {
 
@@ -388,11 +490,11 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
+	baseOutboundAdded = true
 	// Add an inbound for upper streaming protocol
 	fakeNodeInfo = newNodeInfo
 	fakeNodeInfo.Port++
 	fakeNodeInfo.NodeType = "dokodemo-door"
-	dokodemoTag := fmt.Sprintf("dokodemo-door_%s+1", c.Tag)
 	inboundConfig, err = InboundBuilder(c.config, &fakeNodeInfo, dokodemoTag)
 	if err != nil {
 		return err
@@ -402,6 +504,7 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
+	dokodemoInboundAdded = true
 	outBoundConfig, err = OutboundBuilder(c.config, &fakeNodeInfo, dokodemoTag)
 	if err != nil {
 
@@ -412,6 +515,7 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
+	dokodemoOutboundAdded = true
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/dice"
@@ -35,6 +36,11 @@ type dialFunc func(ctx context.Context, dest net.Destination, streamSettings *Me
 
 var transportDialerCache = make(map[string]dialFunc)
 
+var (
+	transportDialerClosersAccess sync.RWMutex
+	transportDialerClosers       []func() error
+)
+
 // RegisterTransportDialer registers a Dialer with given name.
 func RegisterTransportDialer(protocol string, dialer dialFunc) error {
 	if _, found := transportDialerCache[protocol]; found {
@@ -42,6 +48,34 @@ func RegisterTransportDialer(protocol string, dialer dialFunc) error {
 	}
 	transportDialerCache[protocol] = dialer
 	return nil
+}
+
+// RegisterTransportDialerCloser registers cleanup for package-level connection
+// pools owned by a transport. Registered closers remain available across core
+// reloads; each closer must therefore be safe to call more than once.
+func RegisterTransportDialerCloser(closer func() error) {
+	transportDialerClosersAccess.Lock()
+	transportDialerClosers = append(transportDialerClosers, closer)
+	transportDialerClosersAccess.Unlock()
+}
+
+// CloseTransportDialers releases package-level outbound connection pools.
+func CloseTransportDialers() error {
+	transportDialerClosersAccess.RLock()
+	closers := append([]func() error(nil), transportDialerClosers...)
+	transportDialerClosersAccess.RUnlock()
+
+	var errs []error
+	for _, closer := range closers {
+		if err := closer(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	systemDialerAccess.Lock()
+	dnsClient = nil
+	obm = nil
+	systemDialerAccess.Unlock()
+	return errors.Combine(errs...)
 }
 
 // Dial dials a internet connection towards the given destination.
@@ -80,22 +114,26 @@ func DestIpAddress() net.IP {
 }
 
 var (
-	dnsClient dns.Client
-	obm       outbound.Manager
+	systemDialerAccess sync.RWMutex
+	dnsClient          dns.Client
+	obm                outbound.Manager
 )
 
 func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
-	if dnsClient == nil {
+	systemDialerAccess.RLock()
+	client := dnsClient
+	systemDialerAccess.RUnlock()
+	if client == nil {
 		return nil, errors.New("DNS client not initialized").AtError()
 	}
 
-	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
+	ips, _, err := client.LookupIP(domain, dns.IPOption{
 		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
 		IPv6Enable: (localAddr == nil && strategy.PreferIP6()) || (localAddr != nil && localAddr.Family().IsIPv6() && (strategy.PreferIP6() || strategy.FallbackIP6())),
 	})
 	{ // Resolve fallback
 		if (len(ips) == 0 || err != nil) && strategy.HasFallback() && localAddr == nil {
-			ips, _, err = dnsClient.LookupIP(domain, dns.IPOption{
+			ips, _, err = client.LookupIP(domain, dns.IPOption{
 				IPv4Enable: strategy.FallbackIP4(),
 				IPv6Enable: strategy.FallbackIP6(),
 			})
@@ -269,10 +307,13 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 	}
 
 	if len(sockopt.DialerProxy) > 0 {
-		if obm == nil {
+		systemDialerAccess.RLock()
+		outboundManager := obm
+		systemDialerAccess.RUnlock()
+		if outboundManager == nil {
 			return nil, errors.New("there is no outbound manager for dialerProxy").AtError()
 		}
-		h := obm.GetHandler(sockopt.DialerProxy)
+		h := outboundManager.GetHandler(sockopt.DialerProxy)
 		if h == nil {
 			return nil, errors.New("there is no outbound handler for dialerProxy").AtError()
 		}
@@ -283,6 +324,8 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 }
 
 func InitSystemDialer(dc dns.Client, om outbound.Manager) {
+	systemDialerAccess.Lock()
 	dnsClient = dc
 	obm = om
+	systemDialerAccess.Unlock()
 }

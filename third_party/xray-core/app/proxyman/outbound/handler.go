@@ -380,9 +380,18 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
-	common.Close(h.mux)
-	common.Close(h.proxy)
-	return nil
+	var errs []error
+	if err := common.Close(h.mux); err != nil {
+		errs = append(errs, err)
+	}
+	if err := common.Close(h.xudp); err != nil {
+		errs = append(errs, err)
+	}
+	if err := common.Close(h.proxy); err != nil {
+		errs = append(errs, err)
+	}
+	tls.StopCertificateWatchers(tls.ConfigFromStreamSettings(h.streamSettings))
+	return errors.Combine(errs...)
 }
 
 // SenderSettings implements outbound.Handler.

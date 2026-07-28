@@ -111,6 +111,10 @@ func TestClientWorkerClose(t *testing.T) {
 		Writer: tw2,
 	}))
 	defer tw2.Close()
+	common.Must(manager.Close())
+	if !worker2.Closed() {
+		t.Error("worker2 is not closed with the client manager")
+	}
 
 	common.Must(w2.Close())
 }

@@ -64,9 +64,9 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	if !found {
 		transportConfig := streamSettings.ProtocolSettings.(*Config)
-		var xmuxConfig XmuxConfig
-		if transportConfig.Xmux != nil {
-			xmuxConfig = *transportConfig.Xmux
+		xmuxConfig := transportConfig.Xmux
+		if xmuxConfig == nil {
+			xmuxConfig = &XmuxConfig{}
 		}
 
 		xmuxManager = NewXmuxManager(xmuxConfig, func() XmuxConn {
@@ -197,7 +197,6 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					conn, err := internet.DialSystem(ctx, net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), streamSettings.SocketSettings)
 					if err != nil {
 						errors.LogDebug(context.Background(), "skip hop: failed to dial to dest")
-						conn.Close()
 						return nil, errors.New()
 					}
 
@@ -330,11 +329,12 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 	client := &DefaultDialerClient{
 		transportConfig: transportConfig,
+		transport:       transport,
 		client: &http.Client{
 			Transport: transport,
 		},
 		httpVersion:    httpVersion,
-		uploadRawPool:  &sync.Pool{},
+		uploadRawPool:  &uploadConnPool{},
 		dialUploadConn: dialContext,
 	}
 
@@ -343,6 +343,27 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+	internet.RegisterTransportDialerCloser(CloseGlobalDialers)
+}
+
+// CloseGlobalDialers closes all cached split HTTP clients and their TLS
+// certificate watchers. It is safe to call more than once.
+func CloseGlobalDialers() error {
+	globalDialerAccess.Lock()
+	dialers := globalDialerMap
+	globalDialerMap = nil
+	globalDialerAccess.Unlock()
+
+	var errs []error
+	for key, manager := range dialers {
+		if manager != nil {
+			if err := manager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		tls.StopCertificateWatchers(tls.ConfigFromStreamSettings(key.MemoryStreamConfig))
+	}
+	return errors.Combine(errs...)
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {

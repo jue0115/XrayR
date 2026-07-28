@@ -24,6 +24,7 @@ import (
 	routingSession "github.com/xtls/xray-core/features/routing/session"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/pipe"
 
 	"github.com/XrayR-project/XrayR/common/limiter"
@@ -143,8 +144,22 @@ func (*DefaultDispatcher) Start() error {
 }
 
 // Close implements common.Closable.
-func (*DefaultDispatcher) Close() error {
-	return nil
+func (d *DefaultDispatcher) Close() error {
+	var errs []error
+	if d.Limiter != nil {
+		if err := d.Limiter.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if d.RuleManager != nil {
+		if err := d.RuleManager.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := internet.CloseTransportDialers(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Combine(errs...)
 }
 
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link, error) {
@@ -166,7 +181,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	var user *protocol.MemoryUser
 
 	if sessionInbound != nil {
-	// 禁用 splice，避免 Vision 绕过统计
+		// 禁用 splice，避免 Vision 绕过统计
 		sessionInbound.CanSpliceCopy = 3
 		user = sessionInbound.User
 	}
@@ -458,7 +473,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	// Check if domain and protocol hit the rule
 	sessionInbound := session.InboundFromContext(ctx)
 	// Whether the inbound connection contains a user
-	if sessionInbound.User != nil {
+	if sessionInbound != nil && sessionInbound.User != nil {
 		if d.RuleManager.Detect(sessionInbound.Tag, destination.String(), sessionInbound.User.Email) {
 			errors.LogError(ctx, fmt.Sprintf("User %s access %s reject by rule", sessionInbound.User.Email, destination.String()))
 			newError("destination is reject by rule")

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -31,15 +32,89 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	closed          bool
+	transport       http.RoundTripper
+	closed          atomic.Bool
+	closeOnce       sync.Once
+	closeErr        error
 	httpVersion     string
 	// pool of net.Conn, created using dialUploadConn
-	uploadRawPool  *sync.Pool
+	uploadRawPool  *uploadConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
 
+type uploadConnPool struct {
+	access sync.Mutex
+	closed bool
+	conns  []*H1Conn
+}
+
+func (p *uploadConnPool) Get() any {
+	p.access.Lock()
+	defer p.access.Unlock()
+	if len(p.conns) == 0 {
+		return nil
+	}
+	last := len(p.conns) - 1
+	conn := p.conns[last]
+	p.conns[last] = nil
+	p.conns = p.conns[:last]
+	return conn
+}
+
+func (p *uploadConnPool) Put(value any) {
+	conn, ok := value.(*H1Conn)
+	if !ok || conn == nil {
+		return
+	}
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		common.Close(conn)
+		return
+	}
+	p.conns = append(p.conns, conn)
+	p.access.Unlock()
+}
+
+func (p *uploadConnPool) Close() error {
+	p.access.Lock()
+	p.closed = true
+	connections := p.conns
+	p.conns = nil
+	p.access.Unlock()
+
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
+}
+
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed
+	return c.closed.Load()
+}
+
+func (c *DefaultDialerClient) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		var errs []error
+		if c.uploadRawPool != nil {
+			if err := c.uploadRawPool.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if closer, ok := c.transport.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		} else if closer, ok := c.transport.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		c.closeErr = errors.Combine(errs...)
+	})
+	return c.closeErr
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -67,7 +142,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed = true
+				c.closed.Store(true)
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
@@ -101,7 +176,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed = true
+			c.closed.Store(true)
 			return err
 		}
 
@@ -141,7 +216,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed = true
+						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)

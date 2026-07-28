@@ -23,6 +23,60 @@ import (
 
 var globalSessionCache = tls.NewLRUClientSessionCache(128)
 
+type certificateWatcher struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	entry  *Certificate
+}
+
+var (
+	certificateWatchersAccess sync.Mutex
+	certificateWatchers       = make(map[*Config]map[*certificateWatcher]struct{})
+	certificateLocks          = make(map[*Config]*sync.RWMutex)
+	masterKeyLogAccess        sync.Mutex
+	masterKeyLogFiles         = make(map[string]*os.File)
+)
+
+func certificateLock(c *Config) *sync.RWMutex {
+	certificateWatchersAccess.Lock()
+	defer certificateWatchersAccess.Unlock()
+	lock := certificateLocks[c]
+	if lock == nil {
+		lock = new(sync.RWMutex)
+		certificateLocks[c] = lock
+	}
+	return lock
+}
+
+func masterKeyLogWriter(path string) (*os.File, error) {
+	masterKeyLogAccess.Lock()
+	defer masterKeyLogAccess.Unlock()
+	if writer := masterKeyLogFiles[path]; writer != nil {
+		return writer, nil
+	}
+	writer, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	masterKeyLogFiles[path] = writer
+	return writer, nil
+}
+
+func closeMasterKeyLogWriters() error {
+	ocsp.CloseHTTPClient()
+	masterKeyLogAccess.Lock()
+	writers := masterKeyLogFiles
+	masterKeyLogFiles = make(map[string]*os.File)
+	masterKeyLogAccess.Unlock()
+	var errs []error
+	for _, writer := range writers {
+		if err := writer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
+}
+
 // ParseCertificate converts a cert.Certificate to Certificate.
 func ParseCertificate(c *cert.Certificate) *Certificate {
 	if c != nil {
@@ -47,12 +101,15 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 
 // BuildCertificates builds a list of TLS certificates from proto definition.
 func (c *Config) BuildCertificates() []*tls.Certificate {
+	certAccess := certificateLock(c)
 	certs := make([]*tls.Certificate, 0, len(c.Certificate))
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
 		}
 		getX509KeyPair := func() *tls.Certificate {
+			certAccess.RLock()
+			defer certAccess.RUnlock()
 			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
 			if err != nil {
 				errors.LogWarningInner(context.Background(), err, "ignoring invalid X509 key pair")
@@ -71,8 +128,12 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 			continue
 		}
 		index := len(certs) - 1
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+		c.setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+			certAccess.RLock()
+			current := certs[index]
+			certAccess.RUnlock()
+			certCopy := *current
+			cert := &certCopy
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
@@ -87,17 +148,51 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 					cert.OCSPStaple = newOCSPData
 				}
 			}
+			certAccess.Lock()
 			certs[index] = cert
+			certAccess.Unlock()
 		})
 	}
 	return certs
 }
 
-func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
-	go func() {
-		if entry.OneTimeLoading {
+func (c *Config) setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+	if c == nil || entry == nil || entry.OneTimeLoading {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	certAccess := certificateLock(c)
+	watcher := &certificateWatcher{cancel: cancel, done: make(chan struct{}), entry: entry}
+	certificateWatchersAccess.Lock()
+	watchers := certificateWatchers[c]
+	if watchers == nil {
+		watchers = make(map[*certificateWatcher]struct{})
+		certificateWatchers[c] = watchers
+	}
+	for existing := range watchers {
+		if existing.entry == entry {
+			certificateWatchersAccess.Unlock()
+			cancel()
 			return
 		}
+	}
+	watchers[watcher] = struct{}{}
+	certificateWatchersAccess.Unlock()
+
+	go func() {
+		defer close(watcher.done)
+		defer func() {
+			certificateWatchersAccess.Lock()
+			if watchers := certificateWatchers[c]; watchers != nil {
+				delete(watchers, watcher)
+				if len(watchers) == 0 {
+					delete(certificateWatchers, c)
+				}
+			}
+			certificateWatchersAccess.Unlock()
+		}()
+
 		var isOcspstapling bool
 		hotReloadCertInterval := uint64(3600)
 		if entry.OcspStapling != 0 {
@@ -105,6 +200,7 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 			isOcspstapling = true
 		}
 		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
+		defer t.Stop()
 		for {
 			var isReloaded bool
 			if entry.CertificatePath != "" && entry.KeyPath != "" {
@@ -118,16 +214,46 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 					errors.LogErrorInner(context.Background(), err, "failed to parse key")
 					return
 				}
-				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
+				certAccess.RLock()
+				changed := string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key)
+				certAccess.RUnlock()
+				if changed {
+					certAccess.Lock()
 					entry.Certificate = newCert
 					entry.Key = newKey
+					certAccess.Unlock()
 					isReloaded = true
 				}
 			}
 			callback(isReloaded, isOcspstapling)
-			<-t.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
 		}
 	}()
+}
+
+// StopCertificateWatchers stops certificate reload and OCSP refresh workers
+// created from c. It is safe to call more than once.
+func StopCertificateWatchers(c *Config) {
+	if c == nil {
+		return
+	}
+
+	certificateWatchersAccess.Lock()
+	watchers := certificateWatchers[c]
+	delete(certificateWatchers, c)
+	delete(certificateLocks, c)
+	certificateWatchersAccess.Unlock()
+
+	for watcher := range watchers {
+		watcher.cancel()
+	}
+	for watcher := range watchers {
+		<-watcher.done
+	}
 }
 
 func isCertificateExpired(c *tls.Certificate) bool {
@@ -163,7 +289,7 @@ func (c *Config) getCustomCA() []*Certificate {
 	for _, certificate := range c.Certificate {
 		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
 			certs = append(certs, certificate)
-			setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {})
+			c.setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {})
 		}
 	}
 	return certs
@@ -243,8 +369,10 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool, access *sync.RWMutex) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		access.RLock()
+		defer access.RUnlock()
 		if len(certs) == 0 {
 			return nil, errNoCertificates
 		}
@@ -409,7 +537,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(caCerts) > 0 {
 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni, certificateLock(c))
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {
@@ -459,7 +587,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 
 	if len(c.MasterKeyLog) > 0 && c.MasterKeyLog != "none" {
-		writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		writer, err := masterKeyLogWriter(c.MasterKeyLog)
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
 		} else {
@@ -478,6 +606,10 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 
 	return config
+}
+
+func init() {
+	internet.RegisterTransportDialerCloser(closeMasterKeyLogWriters)
 }
 
 // Option for building TLS config.

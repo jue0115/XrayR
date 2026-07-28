@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -178,7 +177,6 @@ func parseIP(s string) (*router.CIDR, error) {
 }
 
 func loadFile(file, code string) ([]byte, error) {
-	runtime.GC()
 	r, err := filesystem.OpenAsset(file)
 	defer r.Close()
 	if err != nil {
@@ -200,7 +198,6 @@ func loadIP(file, code string) ([]*router.CIDR, error) {
 	if err := proto.Unmarshal(bs, &geoip); err != nil {
 		return nil, errors.New("error unmarshal IP in ", file, ": ", code).Base(err)
 	}
-	defer runtime.GC() // or debug.FreeOSMemory()
 	return geoip.Cidr, nil
 }
 
@@ -220,7 +217,6 @@ func loadSite(file, code string) ([]*router.Domain, error) {
 	if err := proto.Unmarshal(bs, &geosite); err != nil {
 		return nil, errors.New("error unmarshal Site in ", file, ": ", code).Base(err)
 	}
-	defer runtime.GC() // or debug.FreeOSMemory()
 	return geosite.Domain, nil
 }
 
