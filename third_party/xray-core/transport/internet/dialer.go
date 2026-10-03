@@ -44,7 +44,7 @@ var (
 // RegisterTransportDialer registers a Dialer with given name.
 func RegisterTransportDialer(protocol string, dialer dialFunc) error {
 	if _, found := transportDialerCache[protocol]; found {
-		return errors.New(protocol, " dialer already registered").AtError()
+		return errors.New(protocol, " dialer already registered")
 	}
 	transportDialerCache[protocol] = dialer
 	return nil
@@ -92,7 +92,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStrea
 		protocol := streamSettings.ProtocolName
 		dialer := transportDialerCache[protocol]
 		if dialer == nil {
-			return nil, errors.New(protocol, " dialer not registered").AtError()
+			return nil, errors.New(protocol, " dialer not registered")
 		}
 		return dialer(ctx, dest, streamSettings)
 	}
@@ -100,7 +100,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStrea
 	if dest.Network == net.Network_UDP {
 		udpDialer := transportDialerCache["udp"]
 		if udpDialer == nil {
-			return nil, errors.New("UDP dialer not registered").AtError()
+			return nil, errors.New("UDP dialer not registered")
 		}
 		return udpDialer(ctx, dest, streamSettings)
 	}
@@ -124,7 +124,7 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 	client := dnsClient
 	systemDialerAccess.RUnlock()
 	if client == nil {
-		return nil, errors.New("DNS client not initialized").AtError()
+		return nil, errors.New("DNS client not initialized")
 	}
 
 	ips, _, err := client.LookupIP(domain, dns.IPOption{
@@ -171,7 +171,6 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
 	)
 	return nc
-
 }
 
 func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
@@ -311,11 +310,11 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		outboundManager := obm
 		systemDialerAccess.RUnlock()
 		if outboundManager == nil {
-			return nil, errors.New("there is no outbound manager for dialerProxy").AtError()
+			return nil, errors.New("there is no outbound manager for dialerProxy")
 		}
 		h := outboundManager.GetHandler(sockopt.DialerProxy)
 		if h == nil {
-			return nil, errors.New("there is no outbound handler for dialerProxy").AtError()
+			return nil, errors.New("there is no outbound handler for dialerProxy")
 		}
 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
 	}

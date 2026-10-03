@@ -32,7 +32,6 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	transport       http.RoundTripper
 	closed          atomic.Bool
 	closeOnce       sync.Once
 	closeErr        error
@@ -82,7 +81,6 @@ func (p *uploadConnPool) Close() error {
 	connections := p.conns
 	p.conns = nil
 	p.access.Unlock()
-
 	var errs []error
 	for _, conn := range connections {
 		if err := conn.Close(); err != nil {
@@ -94,27 +92,6 @@ func (p *uploadConnPool) Close() error {
 
 func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed.Load()
-}
-
-func (c *DefaultDialerClient) Close() error {
-	c.closeOnce.Do(func() {
-		c.closed.Store(true)
-		var errs []error
-		if c.uploadRawPool != nil {
-			if err := c.uploadRawPool.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if closer, ok := c.transport.(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		} else if closer, ok := c.transport.(interface{ CloseIdleConnections() }); ok {
-			closer.CloseIdleConnections()
-		}
-		c.closeErr = errors.Combine(errs...)
-	})
-	return c.closeErr
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -134,10 +111,14 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	if body != nil {
 		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
 	}
-	req, _ := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	if err != nil {
+		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
+		return nil, nil, nil, err
+	}
 	c.transportConfig.FillStreamRequest(req, sessionId, "")
 
-	wrc = &WaitReadCloser{Wait: make(chan struct{})}
+	wrc = &WaitReadCloser{wait: done.New()}
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -146,6 +127,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
+			common.Close(body)
 			wrc.Close()
 			return
 		}
@@ -155,6 +137,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		if resp.StatusCode != 200 || uploadOnly { // stream-up
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
+			common.Close(body)
 			wrc.Close()
 			return
 		}
@@ -245,39 +228,59 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	return nil
 }
 
+func (c *DefaultDialerClient) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		var errs []error
+		if c.uploadRawPool != nil {
+			if err := c.uploadRawPool.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if c.client != nil {
+			if closer, ok := c.client.Transport.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					errs = append(errs, err)
+				}
+			} else {
+				c.client.CloseIdleConnections()
+			}
+		}
+		c.closeErr = errors.Combine(errs...)
+	})
+	return c.closeErr
+}
+
 type WaitReadCloser struct {
-	Wait chan struct{}
-	io.ReadCloser
+	wait   *done.Instance
+	reader atomic.Pointer[io.ReadCloser]
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
-	w.ReadCloser = rc
-	defer func() {
-		if recover() != nil {
-			rc.Close()
+	w.reader.Store(&rc)
+	if w.wait.Done() {
+		if p := w.reader.Swap(nil); p != nil {
+			(*p).Close()
 		}
-	}()
-	close(w.Wait)
+	}
+	w.wait.Close()
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
+	rc := w.reader.Load()
+	if rc == nil {
+		<-w.wait.Wait()
+		if rc = w.reader.Load(); rc == nil {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	return w.ReadCloser.Read(b)
+	return (*rc).Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
+	w.wait.Close()
+	if p := w.reader.Swap(nil); p != nil {
+		return (*p).Close()
 	}
-	defer func() {
-		if recover() != nil && w.ReadCloser != nil {
-			w.ReadCloser.Close()
-		}
-	}()
-	close(w.Wait)
 	return nil
 }

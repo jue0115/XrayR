@@ -1,9 +1,11 @@
 package splithttp
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -22,8 +25,11 @@ func (c *Config) GetNormalizedPath() string {
 		path = "/" + path
 	}
 
-	if path[len(path)-1] != '/' {
-		path = path + "/"
+	if c.GetNormalizedSessionPlacement() == PlacementPath ||
+		c.GetNormalizedSeqPlacement() == PlacementPath {
+		if path[len(path)-1] != '/' {
+			path = path + "/"
+		}
 	}
 
 	return path
@@ -207,10 +213,10 @@ func (c *Config) GetNormalizedServerMaxHeaderBytes() int {
 }
 
 func (c *Config) GetNormalizedSessionPlacement() string {
-	if c.SessionPlacement == "" {
+	if c.SessionIDPlacement == "" {
 		return PlacementPath
 	}
-	return c.SessionPlacement
+	return c.SessionIDPlacement
 }
 
 func (c *Config) GetNormalizedSeqPlacement() string {
@@ -228,8 +234,8 @@ func (c *Config) GetNormalizedUplinkDataPlacement() string {
 }
 
 func (c *Config) GetNormalizedSessionKey() string {
-	if c.SessionKey != "" {
-		return c.SessionKey
+	if c.SessionIDKey != "" {
+		return c.SessionIDKey
 	}
 	switch c.GetNormalizedSessionPlacement() {
 	case PlacementHeader:
@@ -325,14 +331,18 @@ func (c *Config) FillStreamRequest(request *http.Request, sessionId string, seqS
 func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) error {
 	dataPlacement := c.GetNormalizedUplinkDataPlacement()
 
+	data := make([]byte, payload.Len())
+	payload.Copy(data)
+	buf.ReleaseMulti(payload)
+
 	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
 		request.Header = c.GetRequestHeader()
-		request.Body = io.NopCloser(&buf.MultiBufferContainer{MultiBuffer: payload})
-		request.ContentLength = int64(payload.Len())
+		request.Body = io.NopCloser(bytes.NewReader(data))
+		request.ContentLength = int64(len(data))
+		request.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
 	} else {
-		data := make([]byte, payload.Len())
-		payload.Copy(data)
-		buf.ReleaseMulti(payload)
 		switch dataPlacement {
 		case PlacementHeader:
 			request.Header = c.GetRequestHeaderWithPayload(data)
@@ -479,7 +489,41 @@ func init() {
 }
 
 func (c *RangeConfig) rand() int32 {
+	if c == nil {
+		return 0
+	}
 	return int32(crypto.RandBetween(int64(c.From), int64(c.To)))
+}
+
+// predefined
+var PredefinedTable = map[string]string{
+	"ALPHABET": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	"Alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+	"BASE36":   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	"Base62":   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+	"HEX":      "0123456789ABCDEF",
+	"alphabet": "abcdefghijklmnopqrstuvwxyz",
+	"base36":   "0123456789abcdefghijklmnopqrstuvwxyz",
+	"hex":      "0123456789abcdef",
+	"number":   "0123456789",
+}
+
+func (c *Config) GenerateSessionID() string {
+	length := c.SessionIDLength.rand()
+	table := c.SessionIDTable
+	if predefined, ok := PredefinedTable[table]; ok {
+		table = predefined
+	}
+	if table != "" && length > 0 {
+		id := make([]byte, length)
+		for i := range id {
+			id[i] = table[rand.N(len(table))]
+		}
+		return string(id)
+	} else {
+		uuid := uuid.New()
+		return uuid.String()
+	}
 }
 
 func appendToPath(path, value string) string {

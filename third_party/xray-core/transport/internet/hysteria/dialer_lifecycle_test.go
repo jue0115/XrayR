@@ -6,8 +6,8 @@ import (
 )
 
 func TestClientManagerRemovesInactiveEntries(t *testing.T) {
-	manager := &clientManager{m: map[string]*client{
-		"stale": {lastUsed: time.Now().Add(-2 * time.Minute)},
+	manager := &clientManager{m: map[dialerConf]*client{
+		{}: {lastUsed: time.Now().Add(-2 * time.Minute)},
 	}}
 	manager.clean()
 	if len(manager.m) != 0 {
