@@ -19,6 +19,10 @@ Docker 构建镜像使用 `golang:1.27-alpine`。
 
 ## 继续保留的补丁
 
+- `infra/conf/xray.go`：继续支持旧版 freedom `settings.domainStrategy`，
+  静默映射到新版 `streamSettings.sockopt.domainStrategy`，不输出该字段的弃用警告；
+  XrayR 自动生成的出站及自定义出站配置均无需迁移。保留新版拨号实现、
+  新格式支持及其他配置校验/警告，不回退整个出站模块。
 - `common/net/destination.go`：`RawNetAddr` 对空地址返回 nil，避免 UDP 空指针崩溃。
 - `app/proxyman`、`core/xray.go`：关闭入站活动连接、UDP 清理任务和出站池；
   动态处理器添加失败时回滚，关闭/移除处理器时释放其资源。
@@ -46,6 +50,15 @@ Vision 用户账号及 Hysteria2 ALPN/认证参数，并通过实际 Hysteria2 T
 检查认证、XrayR 分流器和数据完整性。
 此测试中的跳过证书验证由 Go TLS 测试客户端执行，不代表新版 Xray 客户端
 接受 `allowInsecure`；本次没有修改客户端。
+
+`service/controller/outbound_compat_test.go` 验证自动生成出站及旧版 JSON 的
+各项域名解析策略、默认值、新格式和旧字段优先级；检查旧字段不产生弃用警告，
+且无效策略仍被拒绝。
+此兼容补丁复测三轮通过，Hysteria2、证书和用户配置回归通过；XrayR 全包
+编译、controller 静态检查及 Linux amd64 构建通过。内核配置测试排除
+GeoData 用例后通过（缺少 `resources/geoip.dat`、`geosite.dat`）。
+完整 `go vet ./infra/conf` 仍报告上游原有的 legacy reverse 返回后的不可达代码；
+核对上游原版后保留该实现，排除 unreachable 检查的其余静态检查通过。
 
 已用本机 Go 1.27.1 复测 XrayR 编译和功能、Windows/Linux amd64 构建，
 以及 DNS、入/出站、Mux、超时读取、Hysteria、TLS 和 XHTTP 本机回归测试。
