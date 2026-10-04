@@ -41,7 +41,7 @@ func (m *AccessMessage) String() string {
 
 	if len(m.Detour) > 0 {
 		builder.WriteString(" [")
-		builder.WriteString(m.Detour)
+		builder.WriteString(strings.ReplaceAll(m.Detour, "_0.0.0.0_", "_"))
 		builder.WriteByte(']')
 	}
 
@@ -51,8 +51,14 @@ func (m *AccessMessage) String() string {
 	}
 
 	if len(m.Email) > 0 {
-		builder.WriteString(" email: ")
-		builder.WriteString(m.Email)
+		email := m.Email
+		// XrayR uses inboundTag|email|uid internally; shorten only its log display.
+		if tag, suffix, ok := strings.Cut(email, "|"); ok && tag != "" &&
+			strings.HasPrefix(m.Detour, tag+" ") && strings.Contains(suffix, "|") {
+			email = suffix
+		}
+		builder.WriteString(" email:")
+		builder.WriteString(email)
 	}
 
 	return builder.String()

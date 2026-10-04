@@ -110,26 +110,56 @@ func (c *Controller) getTraffic(email string) (up int64, down int64, upCounter s
 	downName := "user>>>" + email + ">>>traffic>>>downlink"
 	upCounter = c.stm.GetCounter(upName)
 	downCounter = c.stm.GetCounter(downName)
-	if upCounter != nil && upCounter.Value() != 0 {
+	if upCounter != nil {
 		up = upCounter.Value()
-	} else {
-		upCounter = nil
 	}
-	if downCounter != nil && downCounter.Value() != 0 {
+	if downCounter != nil {
 		down = downCounter.Value()
-	} else {
-		downCounter = nil
 	}
 	return up, down, upCounter, downCounter
 }
 
-func (c *Controller) resetTraffic(upCounterList *[]stats.Counter, downCounterList *[]stats.Counter) {
-	for _, upCounter := range *upCounterList {
-		upCounter.Set(0)
+type trafficSnapshot struct {
+	api.UserTraffic
+	upCounter, downCounter stats.Counter
+}
+
+// Capture the bytes being reported so success only subtracts that amount.
+// A failed report leaves all bytes available for the next reporting cycle.
+func (c *Controller) snapshotTraffic(user api.UserInfo) *trafficSnapshot {
+	up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+	if up <= 0 && down <= 0 {
+		return nil
 	}
-	for _, downCounter := range *downCounterList {
-		downCounter.Set(0)
+	return &trafficSnapshot{
+		UserTraffic: api.UserTraffic{UID: user.UID, Email: user.Email, Upload: up, Download: down},
+		upCounter:   upCounter, downCounter: downCounter,
 	}
+}
+
+func (c *Controller) reportTraffic(snapshots []*trafficSnapshot) error {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	traffic := make([]api.UserTraffic, len(snapshots))
+	for i, snapshot := range snapshots {
+		traffic[i] = snapshot.UserTraffic
+	}
+	if !c.config.DisableUploadTraffic {
+		if err := c.apiClient.ReportUserTraffic(&traffic); err != nil {
+			return err
+		}
+	}
+	for _, snapshot := range snapshots {
+		// Subtract only acknowledged bytes; Set(0) would erase live traffic.
+		if snapshot.upCounter != nil {
+			snapshot.upCounter.Add(-snapshot.Upload)
+		}
+		if snapshot.downCounter != nil {
+			snapshot.downCounter.Add(-snapshot.Download)
+		}
+	}
+	return nil
 }
 
 func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {

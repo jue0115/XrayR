@@ -3,7 +3,7 @@ package mydispatcher_test
 import (
 	"testing"
 
-	. "github.com/xtls/xray-core/app/dispatcher"
+	. "github.com/XrayR-project/XrayR/app/mydispatcher"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 )

@@ -149,7 +149,7 @@ func (w *fileLogWriter) Close() error {
 func CreateStdoutLogWriter() WriterCreator {
 	return func() Writer {
 		return &consoleLogWriter{
-			logger: log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+			logger: log.New(os.Stdout, "", log.Ldate|log.Ltime),
 		}
 	}
 }
@@ -158,7 +158,7 @@ func CreateStdoutLogWriter() WriterCreator {
 func CreateStderrLogWriter() WriterCreator {
 	return func() Writer {
 		return &consoleLogWriter{
-			logger: log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+			logger: log.New(os.Stderr, "", log.Ldate|log.Ltime),
 		}
 	}
 }
@@ -177,7 +177,7 @@ func CreateFileLogWriter(path string) (WriterCreator, error) {
 		}
 		return &fileLogWriter{
 			file:   file,
-			logger: log.New(file, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+			logger: log.New(file, "", log.Ldate|log.Ltime),
 		}
 	}, nil
 }

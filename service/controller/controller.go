@@ -329,11 +329,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if usersChanged {
 			deleted, added = compareUserList(c.userList, newUserInfo)
 			if len(deleted) > 0 {
-				// 1. Block deleted users in the limiter first, so any connection
-				//    established before removal is rejected on its next dispatch
-				//    and stops consuming traffic (fixes the "ghost active user"
-				//    that keeps running for hours and later dumps one huge report).
-				if err := c.DeleteInboundLimiterUsers(c.Tag, deleted); err != nil {
+				// Parameter/auth updates keep the same traffic identity and counters.
+				// Only genuinely removed users should be blocked and unregistered.
+				removed := removedUsers(deleted, added)
+				if err := c.DeleteInboundLimiterUsers(c.Tag, removed); err != nil {
 					c.logger.Print(err)
 				}
 				// 2. Remove from proxy auth (blocks new authentications).
@@ -344,9 +343,8 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				if err := c.removeUsers(deletedEmail, c.Tag); err != nil {
 					c.logger.Print(err)
 				}
-				// 3. Flush residual traffic: report what accumulated since the last
-				//    report, reset, and unregister the counters.
-				c.reportDeletedUserTraffic(deleted)
+				// 3. Flush residual traffic of genuine removals and unregister their counters.
+				c.reportDeletedUserTraffic(removed)
 			}
 			if len(added) > 0 {
 				err = c.addNewUser(&added, c.nodeInfo)
@@ -586,6 +584,24 @@ func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
 	return deleted, added
 }
 
+func removedUsers(deleted, added []api.UserInfo) []api.UserInfo {
+	type identity struct {
+		uid   int
+		email string
+	}
+	readded := make(map[identity]bool, len(added))
+	for _, user := range added {
+		readded[identity{user.UID, user.Email}] = true
+	}
+	removed := make([]api.UserInfo, 0, len(deleted))
+	for _, user := range deleted {
+		if !readded[identity{user.UID, user.Email}] {
+			removed = append(removed, user)
+		}
+	}
+	return removed
+}
+
 func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
 	c.limitedUsers[user] = LimitInfo{
 		end:               time.Now().Unix() + int64(c.config.AutoSpeedLimitConfig.LimitDuration*60),
@@ -599,35 +615,17 @@ func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
 
 // reportDeletedUserTraffic flushes the residual traffic counters of users that
 // are being removed: it reports whatever they accumulated since the last report,
-// resets the counters on success, and unregisters them so a re-added user cannot
-// resurface stale accumulation as one huge delta.
+// subtracts acknowledged bytes, and unregisters them. Failed reports of removed
+// users are deliberately discarded instead of retained for a later re-addition.
 func (c *Controller) reportDeletedUserTraffic(deleted []api.UserInfo) {
-	var userTraffic []api.UserTraffic
-	var upCounterList []stats.Counter
-	var downCounterList []stats.Counter
-	for i := range deleted {
-		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&deleted[i]))
-		if up > 0 || down > 0 {
-			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      deleted[i].UID,
-				Email:    deleted[i].Email,
-				Upload:   up,
-				Download: down,
-			})
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
-			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
-			}
+	var snapshots []*trafficSnapshot
+	for _, user := range deleted {
+		if snapshot := c.snapshotTraffic(user); snapshot != nil {
+			snapshots = append(snapshots, snapshot)
 		}
 	}
-	if len(userTraffic) > 0 && !c.config.DisableUploadTraffic {
-		if err := c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
-			c.logger.Print(err)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
-		}
+	if err := c.reportTraffic(snapshots); err != nil {
+		c.logger.Print(err)
 	}
 	// Unregister counters regardless, so the stats manager keeps no stale counter
 	// that a re-added user would later read as one huge delta.
@@ -679,14 +677,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 	}
 
 	// Get User traffic
-	var userTraffic []api.UserTraffic
-	var upCounterList []stats.Counter
-	var downCounterList []stats.Counter
+	var userTraffic []*trafficSnapshot
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 	UpdatePeriodic := int64(c.config.UpdatePeriodic)
 	limitedUsers := make([]api.UserInfo, 0)
 	for _, user := range *c.userList {
-		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+		up, down, _, _ := c.getTraffic(c.buildUserTag(&user))
 		if up > 0 || down > 0 {
 			// Over speed users
 			if AutoSpeedLimit > 0 {
@@ -706,17 +702,8 @@ func (c *Controller) userInfoMonitor() (err error) {
 					delete(c.warnedUsers, user)
 				}
 			}
-			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      user.UID,
-				Email:    user.Email,
-				Upload:   up,
-				Download: down})
-
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
-			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
+			if snapshot := c.snapshotTraffic(user); snapshot != nil {
+				userTraffic = append(userTraffic, snapshot)
 			}
 		} else {
 			delete(c.warnedUsers, user)
@@ -728,15 +715,8 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 	if len(userTraffic) > 0 {
-		var err error // Define an empty error
-		if !c.config.DisableUploadTraffic {
-			err = c.apiClient.ReportUserTraffic(&userTraffic)
-		}
-		// If report traffic error, not clear the traffic
-		if err != nil {
+		if err := c.reportTraffic(userTraffic); err != nil {
 			c.logger.Print(err)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
 		}
 	}
 
