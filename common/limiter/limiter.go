@@ -30,8 +30,9 @@ type UserInfo struct {
 }
 
 type onlineDevice struct {
-	uid      int
-	lastSeen int64
+	uid         int
+	lastSeen    int64
+	connections int
 }
 
 const onlineDeviceTTL = 5 * time.Minute
@@ -40,10 +41,11 @@ const blockedUserTTL = 24 * time.Hour
 type InboundInfo struct {
 	Tag            string
 	NodeSpeedLimit uint64
-	UserInfo       *sync.Map // Key: Email value: UserInfo
-	BucketHub      *sync.Map // key: Email, value: *rate.Limiter
-	UserOnlineIP   *sync.Map // Key: Email, value: {Key: IP, value: UID}
-	BlockedUsers   *sync.Map // Key: Email, value: struct{} — users removed by panel; reject their lingering connections
+	UserInfo       *sync.Map  // Key: Email value: UserInfo
+	BucketHub      *sync.Map  // key: Email, value: *rate.Limiter
+	UserOnlineIP   *sync.Map  // Key: Email, value: *sync.Map of IP -> onlineDevice
+	BlockedUsers   *sync.Map  // Key: Email, value: expiry UnixNano; reject removed users' lingering connections
+	onlineAccess   sync.Mutex // Serializes connection admission, release and idle eviction.
 	closed         atomic.Bool
 	GlobalLimit    struct {
 		access         sync.Mutex
@@ -131,6 +133,8 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 	}
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		inboundInfo.onlineAccess.Lock()
+		defer inboundInfo.onlineAccess.Unlock()
 		// Update User info
 		for _, u := range *updatedUserList {
 			key := fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)
@@ -171,6 +175,8 @@ func (l *Limiter) DeleteUsers(tag string, users []api.UserInfo) error {
 	}
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		inboundInfo.onlineAccess.Lock()
+		defer inboundInfo.onlineAccess.Unlock()
 		if inboundInfo.BlockedUsers == nil {
 			inboundInfo.BlockedUsers = new(sync.Map)
 		}
@@ -223,6 +229,8 @@ func (i *InboundInfo) close() error {
 			errs = append(errs, err)
 		}
 	}
+	i.onlineAccess.Lock()
+	defer i.onlineAccess.Unlock()
 	clearMap(i.UserInfo)
 	clearMap(i.BucketHub)
 	clearMap(i.UserOnlineIP)
@@ -256,14 +264,26 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		inboundInfo.onlineAccess.Lock()
+		defer inboundInfo.onlineAccess.Unlock()
 		now := time.Now().UnixNano()
+		// Reuse periodic online reporting to evict expired records even when a
+		// removed user never reconnects. Do not delete a concurrently renewed ban.
+		if inboundInfo.BlockedUsers != nil {
+			inboundInfo.BlockedUsers.Range(func(key, expiry any) bool {
+				if now >= expiry.(int64) {
+					inboundInfo.BlockedUsers.CompareAndDelete(key, expiry)
+				}
+				return true
+			})
+		}
 		inboundInfo.UserOnlineIP.Range(func(key, value interface{}) bool {
 			email := key.(string)
 			ipMap := value.(*sync.Map)
 			active := 0
 			ipMap.Range(func(key, value interface{}) bool {
 				device := value.(onlineDevice)
-				if time.Duration(now-device.lastSeen) > onlineDeviceTTL {
+				if device.connections == 0 && time.Duration(now-device.lastSeen) > onlineDeviceTTL {
 					ipMap.Delete(key)
 					return true
 				}
@@ -285,9 +305,12 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	return &onlineUser, nil
 }
 
-func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {
+// GetUserBucket admits one dispatched connection. The caller must release it
+// when both transfer directions finish or its context is canceled. An open
+// connection pins its online IP and shared bucket, even when it is idle.
+func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool, release func()) {
 	if l.closed.Load() {
-		return nil, false, true
+		return nil, false, true, nil
 	}
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		var (
@@ -296,19 +319,28 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		)
 
 		inboundInfo := value.(*InboundInfo)
+		inboundInfo.onlineAccess.Lock()
 		if inboundInfo.closed.Load() {
-			return nil, false, true
+			inboundInfo.onlineAccess.Unlock()
+			return nil, false, true, nil
 		}
 		nodeLimit := inboundInfo.NodeSpeedLimit
 
 		// Reject users removed by the panel: their auth is gone, but a connection
 		// established before removal would otherwise keep consuming traffic.
 		if inboundInfo.BlockedUsers != nil {
-			if value, blocked := inboundInfo.BlockedUsers.Load(email); blocked {
-				if time.Now().UnixNano() < value.(int64) {
-					return nil, false, true
+			for {
+				value, blocked := inboundInfo.BlockedUsers.Load(email)
+				if !blocked {
+					break
 				}
-				inboundInfo.BlockedUsers.Delete(email)
+				if time.Now().UnixNano() < value.(int64) {
+					inboundInfo.onlineAccess.Unlock()
+					return nil, false, true, nil
+				}
+				if inboundInfo.BlockedUsers.CompareAndDelete(email, value) {
+					break
+				}
 			}
 		}
 
@@ -319,51 +351,51 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 			deviceLimit = u.DeviceLimit
 		}
 
-		// Local device limit
-		// Fast path: reuse the user's existing online-IP map instead of
-		// allocating a throwaway sync.Map on every connection. Only allocate
-		// when the user is not online yet.
+		// Use the same lock as cleanup so admission cannot attach to an IP map
+		// or bucket which is being removed by the online-reporting task.
 		v, online := inboundInfo.UserOnlineIP.Load(email)
 		if !online {
-			ipMap := new(sync.Map)
-			ipMap.Store(ip, onlineDevice{uid: uid, lastSeen: time.Now().UnixNano()})
-			// LoadOrStore still resolves the race where two connections of a
-			// first-time-online user arrive concurrently.
-			v, online = inboundInfo.UserOnlineIP.LoadOrStore(email, ipMap)
+			v = new(sync.Map)
+			inboundInfo.UserOnlineIP.Store(email, v)
 		}
-		// If any device is already online
-		if online {
-			ipMap := v.(*sync.Map)
-			now := time.Now().UnixNano()
-			ipMap.Range(func(key, value interface{}) bool {
-				device := value.(onlineDevice)
-				if time.Duration(now-device.lastSeen) > onlineDeviceTTL {
-					ipMap.Delete(key)
-				}
-				return true
-			})
-			// If this is a new ip
-			if _, ok := ipMap.LoadOrStore(ip, onlineDevice{uid: uid, lastSeen: now}); !ok {
-				counter := 0
-				ipMap.Range(func(key, value interface{}) bool {
-					counter++
-					return true
-				})
-				if counter > deviceLimit && deviceLimit > 0 {
-					ipMap.Delete(ip)
-					return nil, false, true
-				}
+		ipMap := v.(*sync.Map)
+		now := time.Now().UnixNano()
+		devices := 0
+		ipMap.Range(func(key, value interface{}) bool {
+			device := value.(onlineDevice)
+			if device.connections == 0 && time.Duration(now-device.lastSeen) > onlineDeviceTTL {
+				ipMap.Delete(key)
 			} else {
-				ipMap.Store(ip, onlineDevice{uid: uid, lastSeen: now})
+				devices++
 			}
+			return true
+		})
+		device := onlineDevice{uid: uid}
+		if value, found := ipMap.Load(ip); found {
+			device = value.(onlineDevice)
+		} else if deviceLimit > 0 && devices >= deviceLimit {
+			inboundInfo.onlineAccess.Unlock()
+			return nil, false, true, nil
 		}
-
-		// GlobalLimit
-		if inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
-			if reject := globalLimit(inboundInfo, email, uid, ip, deviceLimit); reject {
-				return nil, false, true
+		device.uid = uid
+		device.lastSeen = now
+		device.connections++
+		ipMap.Store(ip, device)
+		release = sync.OnceFunc(func() {
+			inboundInfo.onlineAccess.Lock()
+			defer inboundInfo.onlineAccess.Unlock()
+			if inboundInfo.closed.Load() {
+				return
 			}
-		}
+			// Capture this map rather than looking up the email again: deleting
+			// and re-adding a user must not release their new connections.
+			if value, found := ipMap.Load(ip); found {
+				device := value.(onlineDevice)
+				device.connections--
+				device.lastSeen = time.Now().UnixNano()
+				ipMap.Store(ip, device)
+			}
+		})
 
 		// Speed limit
 		limit := determineRate(nodeLimit, userLimit) // Determine the speed limit rate
@@ -372,17 +404,25 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 			// rate.Limiter on every connection. The stored bucket is kept in sync
 			// with the current limit by UpdateInboundLimiter.
 			if v, ok := inboundInfo.BucketHub.Load(email); ok {
-				return v.(*rate.Limiter), true, false
+				limiter = v.(*rate.Limiter)
+			} else {
+				limiter = rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
+				inboundInfo.BucketHub.Store(email, limiter)
 			}
-			limiter := rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
-			v, _ := inboundInfo.BucketHub.LoadOrStore(email, limiter)
-			return v.(*rate.Limiter), true, false
-		} else {
-			return nil, false, false
 		}
+		inboundInfo.onlineAccess.Unlock()
+
+		// Do not hold the local-state lock while waiting for Redis.
+		if inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
+			if reject := globalLimit(inboundInfo, email, uid, ip, deviceLimit); reject {
+				release()
+				return nil, false, true, nil
+			}
+		}
+		return limiter, limiter != nil, false, release
 	} else {
 		errors.LogDebug(context.Background(), "Get Inbound Limiter information failed")
-		return nil, false, false
+		return nil, false, false, nil
 	}
 }
 

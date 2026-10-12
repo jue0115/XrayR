@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
@@ -10,19 +12,24 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/XrayR-project/XrayR/api"
 	"github.com/XrayR-project/XrayR/common/limiter"
 )
 
 func (c *Controller) removeInbound(tag string) error {
-	err := c.ibm.RemoveHandler(context.Background(), tag)
-	return err
+	if err := c.ibm.RemoveHandler(context.Background(), tag); err != nil {
+		return fmt.Errorf("remove inbound tag=%s: %w", tag, err)
+	}
+	return nil
 }
 
 func (c *Controller) removeOutbound(tag string) error {
-	err := c.obm.RemoveHandler(context.Background(), tag)
-	return err
+	if err := c.obm.RemoveHandler(context.Background(), tag); err != nil {
+		return fmt.Errorf("remove outbound tag=%s: %w", tag, err)
+	}
+	return nil
 }
 
 func (c *Controller) addInbound(config *core.InboundHandlerConfig) error {
@@ -55,54 +62,79 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 	return nil
 }
 
-func (c *Controller) addUsers(users []*protocol.User, tag string) error {
+func (c *Controller) userManager(tag string) (proxy.UserManager, error) {
 	handler, err := c.ibm.GetHandler(context.Background(), tag)
 	if err != nil {
-		return fmt.Errorf("no such inbound tag: %s", err)
+		return nil, fmt.Errorf("get inbound %s: %w", tag, err)
 	}
 	inboundInstance, ok := handler.(proxy.GetInbound)
 	if !ok {
-		return fmt.Errorf("handler %s has not implemented proxy.GetInbound", tag)
+		return nil, fmt.Errorf("handler %s has not implemented proxy.GetInbound", tag)
 	}
 
 	userManager, ok := inboundInstance.GetInbound().(proxy.UserManager)
 	if !ok {
-		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
+		return nil, fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
 	}
-	for _, item := range users {
-		mUser, err := item.ToMemoryUser()
-		if err != nil {
-			return err
-		}
-		err = userManager.AddUser(context.Background(), mUser)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return userManager, nil
 }
 
-func (c *Controller) removeUsers(users []string, tag string) error {
-	handler, err := c.ibm.GetHandler(context.Background(), tag)
+func (c *Controller) addUsers(users []*protocol.User, tag string) ([]string, error) {
+	manager, err := c.userManager(tag)
 	if err != nil {
-		return fmt.Errorf("no such inbound tag: %s", err)
+		return nil, err
 	}
-	inboundInstance, ok := handler.(proxy.GetInbound)
-	if !ok {
-		return fmt.Errorf("handler %s is not implement proxy.GetInbound", tag)
-	}
-
-	userManager, ok := inboundInstance.GetInbound().(proxy.UserManager)
-	if !ok {
-		return fmt.Errorf("handler %s is not implement proxy.UserManager", err)
-	}
-	for _, email := range users {
-		err = userManager.RemoveUser(context.Background(), email)
-		if err != nil {
-			return err
+	var added []string
+	var failures []error
+	for _, item := range users {
+		if item == nil {
+			failures = append(failures, errors.New("empty user account from user builder"))
+			continue
 		}
+		mUser, err := item.ToMemoryUser()
+		if err != nil {
+			failures = append(failures, fmt.Errorf("parse user email:%s: %w", strings.TrimPrefix(item.Email, tag+"|"), err))
+			continue
+		}
+		if existing := manager.GetUser(context.Background(), mUser.Email); existing != nil {
+			// A retry must not fail on users already added successfully. Compare
+			// full accounts: VLESS Account.Equals compares only the UUID, not flow.
+			if existing.Level == mUser.Level && proto.Equal(existing.Account.ToProto(), mUser.Account.ToProto()) {
+				added = append(added, item.Email)
+				continue
+			}
+			if err := manager.RemoveUser(context.Background(), mUser.Email); err != nil {
+				failures = append(failures, fmt.Errorf("replace user email:%s: %w", strings.TrimPrefix(item.Email, tag+"|"), err))
+				continue
+			}
+		}
+		if err := manager.AddUser(context.Background(), mUser); err != nil {
+			failures = append(failures, fmt.Errorf("add user email:%s: %w", strings.TrimPrefix(item.Email, tag+"|"), err))
+			continue
+		}
+		added = append(added, item.Email)
 	}
-	return nil
+	return added, errors.Join(failures...)
+}
+
+func (c *Controller) removeUsers(users []string, tag string) ([]string, error) {
+	manager, err := c.userManager(tag)
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	var failures []error
+	for _, email := range users {
+		// Already absent is success, including a previous partial retry.
+		if manager.GetUser(context.Background(), email) != nil {
+			if err := manager.RemoveUser(context.Background(), email); err != nil {
+				failures = append(failures, fmt.Errorf("remove user email:%s: %w", strings.TrimPrefix(email, tag+"|"), err))
+				continue
+			}
+		}
+		removed = append(removed, email)
+	}
+	return removed, errors.Join(failures...)
 }
 
 func (c *Controller) getTraffic(email string) (up int64, down int64, upCounter stats.Counter, downCounter stats.Counter) {
@@ -188,8 +220,12 @@ func (c *Controller) DeleteInboundLimiterUsers(tag string, users []api.UserInfo)
 func (c *Controller) unregisterTraffic(email string) {
 	upName := "user>>>" + email + ">>>traffic>>>uplink"
 	downName := "user>>>" + email + ">>>traffic>>>downlink"
-	c.stm.UnregisterCounter(upName)
-	c.stm.UnregisterCounter(downName)
+	if err := c.stm.UnregisterCounter(upName); err != nil {
+		c.logger.Warnf("Unregister uplink counter failed email:%s: %s", strings.TrimPrefix(email, c.Tag+"|"), err)
+	}
+	if err := c.stm.UnregisterCounter(downName); err != nil {
+		c.logger.Warnf("Unregister downlink counter failed email:%s: %s", strings.TrimPrefix(email, c.Tag+"|"), err)
+	}
 }
 
 func (c *Controller) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {

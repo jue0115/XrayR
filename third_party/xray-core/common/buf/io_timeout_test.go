@@ -1,10 +1,54 @@
 package buf
 
 import (
+	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type interruptibleTimeoutReader struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (r *interruptibleTimeoutReader) ReadMultiBuffer() (MultiBuffer, error) {
+	<-r.done
+	return nil, io.EOF
+}
+
+func (r *interruptibleTimeoutReader) Interrupt() {
+	r.once.Do(func() { close(r.done) })
+}
+
+func TestTimeoutWrapperReaderInterruptsPendingRead(t *testing.T) {
+	for _, closeReader := range []bool{false, true} {
+		r := &interruptibleTimeoutReader{done: make(chan struct{})}
+		defer r.Interrupt()
+		w := &TimeoutWrapperReader{Reader: r}
+		if _, err := w.ReadMultiBufferTimeout(time.Millisecond); err != ErrReadTimeout {
+			t.Fatalf("expected pending read, got %v", err)
+		}
+		if closeReader {
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			w.Interrupt()
+		}
+		done := make(chan error, 1)
+		go func() { _, err := w.ReadMultiBuffer(); done <- err }()
+		select {
+		case err := <-done:
+			if err != io.EOF {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("pending read survived wrapper interruption")
+		}
+	}
+}
 
 type testReadResult struct {
 	buffer MultiBuffer

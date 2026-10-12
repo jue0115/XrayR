@@ -33,6 +33,18 @@ import (
 
 var errSniffingTimeout = newError("timeout on sniffing")
 
+// Direct links have no pipe to interrupt. Closing the client connection also
+// unblocks readers such as VisionReader that do not expose Interrupt/Close.
+type connectionReader struct {
+	buf.Reader
+	conn net.Conn
+}
+
+func (r *connectionReader) Interrupt() {
+	common.Close(r.conn)
+	common.Interrupt(r.Reader)
+}
+
 type cachedReader struct {
 	sync.Mutex
 	reader buf.TimeoutReader
@@ -188,7 +200,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		// Speed Limit and Device Limit
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
+		bucket, ok, reject, release := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
 			common.Close(outboundLink.Writer)
@@ -198,8 +210,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			return nil, nil, newError("Devices reach the limit: ", user.Email)
 		}
 		if ok {
-			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
+			inboundLink.Writer = d.Limiter.RateWriter(ctx, inboundLink.Writer, bucket)
+			outboundLink.Writer = d.Limiter.RateWriter(ctx, outboundLink.Writer, bucket)
+		}
+		if release != nil {
+			uplink, downlink := trackConnection(ctx, release)
+			outboundLink.Reader = &connectionTimeoutReader{TimeoutReader: outboundLink.Reader.(buf.TimeoutReader), done: uplink}
+			outboundLink.Writer = &connectionWriter{Writer: outboundLink.Writer, done: downlink}
 		}
 
 		p := d.policy.ForLevel(user.Level)
@@ -284,7 +301,10 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if err != nil {
 		return nil, err
 	}
-	pipeReader, isPipe := outbound.Reader.(*pipe.Reader)
+	_, isPipe := outbound.Reader.(*pipe.Reader)
+	if reader, tracked := outbound.Reader.(*connectionTimeoutReader); tracked {
+		_, isPipe = reader.TimeoutReader.(*pipe.Reader)
+	}
 	if !sniffingRequest.Enabled || !isPipe {
 		// Skip sniffing for non-pipe readers (e.g. VLESS Vision's *proxy.VisionReader),
 		// which are stateful and must not be wrapped/read out of band.
@@ -292,7 +312,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	} else {
 		go func() {
 			cReader := &cachedReader{
-				reader: pipeReader,
+				reader: outbound.Reader.(buf.TimeoutReader),
 			}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
@@ -331,10 +351,13 @@ func (d *DefaultDispatcher) wrapLinkStats(ctx context.Context, link *transport.L
 	}
 
 	// Wrap the reader so uplink bytes can be counted (upstream WrapLink pattern).
+	if sessionInbound != nil && sessionInbound.Conn != nil {
+		link.Reader = &connectionReader{Reader: link.Reader, conn: sessionInbound.Conn}
+	}
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 
 	if user != nil && len(user.Email) > 0 {
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
+		bucket, ok, reject, release := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
 			common.Close(link.Writer)
@@ -342,7 +365,7 @@ func (d *DefaultDispatcher) wrapLinkStats(ctx context.Context, link *transport.L
 			return nil, newError("Devices reach the limit: ", user.Email)
 		}
 		if ok {
-			link.Writer = d.Limiter.RateWriter(link.Writer, bucket)
+			link.Writer = d.Limiter.RateWriter(ctx, link.Writer, bucket)
 		}
 
 		p := d.policy.ForLevel(user.Level)
@@ -360,6 +383,11 @@ func (d *DefaultDispatcher) wrapLinkStats(ctx context.Context, link *transport.L
 					Writer:  link.Writer,
 				}
 			}
+		}
+		if release != nil {
+			uplink, downlink := trackConnection(ctx, release)
+			link.Reader = &connectionTimeoutReader{TimeoutReader: link.Reader.(buf.TimeoutReader), done: uplink}
+			link.Writer = &connectionWriter{Writer: link.Writer, done: downlink}
 		}
 	}
 	return link, nil
@@ -391,6 +419,12 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if err != nil {
 		return err
 	}
+	reader, writer := outbound.Reader, outbound.Writer
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		common.Interrupt(reader)
+		common.Interrupt(writer)
+	})
+	defer stopInterrupt()
 
 	sniffingRequest := content.SniffingRequest
 	// DispatchLink must run synchronously: unlike Dispatch it wires the inbound
@@ -513,6 +547,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				errors.LogWarning(ctx, "non existing outTag: ", outTag)
 			}
 		} else {
+			if err != common.ErrNoClue {
+				errors.LogErrorInner(ctx, err, "failed to pick route for ", destination)
+			}
 			errors.LogInfo(ctx, "default route for ", destination)
 		}
 	}

@@ -25,7 +25,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.12.1
-	github.com/xtls/xray-core v1.260930.0
+	github.com/xtls/xray-core v1.261010.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/net v0.59.0
 	golang.org/x/time v0.15.0
@@ -271,6 +271,7 @@ require (
 	github.com/yandex-cloud/go-genproto v0.0.0-20240311082839-58e1a7554a75 // indirect
 	github.com/yandex-cloud/go-sdk v0.0.0-20240311083148-81c0846b96cd // indirect
 	github.com/yosssi/ace v0.0.5 // indirect
+	github.com/yuin/gopher-lua v1.1.2 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
@@ -284,6 +285,7 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/arch v0.7.0 // indirect
+	golang.org/x/crypto/x509roots/fallback v0.0.0-20261005185213-c3db4df58582 // indirect
 	golang.org/x/exp v0.0.0-20251209150349-8475f28825e9 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
@@ -309,6 +311,7 @@ require (
 	k8s.io/apimachinery v0.29.2 // indirect
 	k8s.io/klog/v2 v2.120.1 // indirect
 	k8s.io/utils v0.0.0-20240310230437-4693a0247e57 // indirect
+	layeh.com/gopher-luar v1.0.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect

@@ -26,6 +26,11 @@ var (
 	hostRe       = regexp.MustCompile(`(?m)host=([\w.]+)\|?`)        // Host
 )
 
+type userListResponse struct {
+	Ret  uint           `json:"ret"`
+	Data []UserResponse `json:"data"`
+}
+
 // APIClient create a api client to the panel.
 type APIClient struct {
 	client           *resty.Client
@@ -145,14 +150,23 @@ func (c *APIClient) assembleURL(path string) string {
 	return c.APIHost + path
 }
 
-func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (*Response, error) {
+func (c *APIClient) checkHTTPResponse(res *resty.Response, path string, err error) error {
 	if err != nil {
-		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
+		return fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
-
+	if res == nil {
+		return fmt.Errorf("request %s failed: empty response", c.assembleURL(path))
+	}
 	if res.StatusCode() >= 400 {
 		body := res.Body()
-		return nil, fmt.Errorf("request %s failed: %s, %v", c.assembleURL(path), string(body), err)
+		return fmt.Errorf("request %s failed: %s, %v", c.assembleURL(path), string(body), err)
+	}
+	return nil
+}
+
+func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (*Response, error) {
+	if err := c.checkHTTPResponse(res, path, err); err != nil {
+		return nil, err
 	}
 	response := res.Result().(*Response)
 
@@ -218,38 +232,52 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 
 // GetUserList will pull user form ssPanel
 func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
-	path := "/mod_mu/users"
-	res, err := c.client.R().
-		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetHeader("If-None-Match", c.eTags["users"]).
-		SetResult(&Response{}).
-		ForceContentType("application/json").
-		Get(path)
-	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
-		return nil, errors.New(api.UserNotModified)
-	}
-
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["users"] {
-		c.eTags["users"] = res.Header().Get("ETag")
-	}
-
-	response, err := c.parseResponse(res, path, err)
+	users, err := c.getUsers(true)
 	if err != nil {
 		return nil, err
 	}
+	return c.ParseUserListResponse(&users)
+}
 
-	userListResponse := new([]UserResponse)
-
-	if err := json.Unmarshal(response.Data, userListResponse); err != nil {
-		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(userListResponse), err)
+// Both normal user refresh and Shadowsocks node parsing read this endpoint.
+// Decode directly into users instead of retaining a second RawMessage copy.
+func (c *APIClient) getUsers(useETag bool) ([]UserResponse, error) {
+	path := "/mod_mu/users"
+	response := &userListResponse{}
+	request := c.client.R().
+		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
+		SetResult(response).
+		ForceContentType("application/json")
+	if useETag {
+		request.SetHeader("If-None-Match", c.eTags["users"])
 	}
-	userList, err := c.ParseUserListResponse(userListResponse)
-	if err != nil {
-		res, _ := json.Marshal(userListResponse)
-		return nil, fmt.Errorf("parse user list failed: %s", string(res))
+	res, err := request.Get(path)
+	if err := c.checkHTTPResponse(res, path, err); err != nil {
+		return nil, err
 	}
-	return userList, nil
+	if useETag && res.StatusCode() == 304 {
+		return nil, errors.New(api.UserNotModified)
+	}
+	if response.Ret != 1 {
+		data, _ := json.Marshal(response)
+		return nil, fmt.Errorf("ret %s invalid", data)
+	}
+	if response.Data == nil {
+		// JSON null remains a valid empty list, but missing data must not delete
+		// every user. Only this empty/error path needs to inspect the raw field.
+		var raw Response
+		if err := json.Unmarshal(res.Body(), &raw); err != nil {
+			return nil, fmt.Errorf("unmarshal users failed: %w", err)
+		}
+		if len(raw.Data) == 0 {
+			return nil, errors.New("unmarshal users failed: missing data")
+		}
+	}
+	// Remember only successfully validated responses, never a failed refresh.
+	if useETag && res.Header().Get("ETag") != "" {
+		c.eTags["users"] = res.Header().Get("ETag")
+	}
+	return response.Data, nil
 }
 
 // ReportNodeStatus reports the node status to the ssPanel
@@ -496,27 +524,13 @@ func (c *APIClient) ParseSSNodeResponse(nodeInfoResponse *NodeInfoResponse) (*ap
 	var port uint32 = 0
 	var speedLimit uint64 = 0
 	var method string
-	path := "/mod_mu/users"
-	res, err := c.client.R().
-		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetResult(&Response{}).
-		ForceContentType("application/json").
-		Get(path)
-
-	response, err := c.parseResponse(res, path, err)
+	users, err := c.getUsers(false)
 	if err != nil {
 		return nil, err
 	}
-
-	userListResponse := new([]UserResponse)
-
-	if err := json.Unmarshal(response.Data, userListResponse); err != nil {
-		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(userListResponse), err)
-	}
-
 	// init server port
-	if len(*userListResponse) != 0 {
-		port = (*userListResponse)[0].Port
+	if len(users) != 0 {
+		port = users[0].Port
 	}
 
 	if c.SpeedLimit > 0 {
@@ -684,7 +698,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 
 	var deviceLimit, localDeviceLimit = 0, 0
 	var speedLimit uint64 = 0
-	var userList []api.UserInfo
+	userList := make([]api.UserInfo, 0, len(*userInfoResponse))
 	for _, user := range *userInfoResponse {
 		if c.DeviceLimit > 0 {
 			deviceLimit = c.DeviceLimit
@@ -725,6 +739,13 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			Port:        user.Port,
 			Method:      user.Method,
 		})
+	}
+	// Most nodes accept nearly the entire list. If device filtering removes
+	// most users, do not retain a full-sized backing array for a sparse list.
+	if len(userList) == 0 {
+		userList = nil
+	} else if len(userList) < cap(userList)/2 {
+		userList = append([]api.UserInfo(nil), userList...)
 	}
 
 	return &userList, nil

@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
@@ -29,6 +30,8 @@ import (
 type client struct {
 	sync.Mutex
 
+	instance     *core.Instance
+	forced       bool
 	dest         net.Destination
 	config       *Config
 	tlsConfig    *gotls.Config
@@ -73,11 +76,14 @@ func (c *client) close() {
 }
 
 func (c *client) dial(ctx context.Context) error {
-	status := c.status()
-	if status == StatusActive {
-		return nil
+	if c.forced {
+		return errors.New("client is closed")
 	}
-	if status == StatusInactive {
+
+	switch c.status() {
+	case StatusActive:
+		return nil
+	case StatusInactive:
 		c.close()
 	}
 
@@ -99,7 +105,7 @@ func (c *client) dial(ctx context.Context) error {
 		ChromeParrot:                   !quicParams.DisableChromeParrot,
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           MaxDatagramFrameSize,
-		OmitMaxDatagramFrameSize:       time.Now().After(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)),
+		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
 	}
 	if quicParams.InitStreamReceiveWindow == 0 {
@@ -265,12 +271,20 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	return c.udpSM.udp()
 }
 
-func (c *client) clean() {
+func (c *client) clean(force bool) bool {
 	c.Lock()
-	if c.status() == StatusInactive {
-		c.close()
+	defer c.Unlock()
+	if force {
+		c.forced = true
 	}
-	c.Unlock()
+	status := c.status()
+	remove := force || status == StatusInactive || (status == StatusNull && time.Since(c.lastUsed) > time.Minute)
+	if remove {
+		c.forced = true
+		c.close()
+		tls.StopCertificateWatchers(c.tlsSource)
+	}
+	return remove
 }
 
 type dialerConf struct {
@@ -286,17 +300,22 @@ type clientManager struct {
 }
 
 func (m *clientManager) clean() {
-	m.Lock()
-	defer m.Unlock()
+	m.RLock()
+	clients := make(map[dialerConf]*client, len(m.m))
 	for key, c := range m.m {
-		c.Lock()
-		state := c.status()
-		if state == StatusInactive || (state == StatusNull && time.Since(c.lastUsed) > time.Minute) {
-			c.close()
-			tls.StopCertificateWatchers(c.tlsSource)
-			delete(m.m, key)
+		clients[key] = c
+	}
+	m.RUnlock()
+	// Never wait for instance lifecycle or an in-flight dial while holding the pool lock.
+	for key, c := range clients {
+		force := c.instance != nil && !c.instance.IsRunning()
+		if c.clean(force) {
+			m.Lock()
+			if m.m[key] == c {
+				delete(m.m, key)
+			}
+			m.Unlock()
 		}
-		c.Unlock()
 	}
 }
 
@@ -313,10 +332,7 @@ func (m *clientManager) close() error {
 		_ = cleanupTask.Close()
 	}
 	for _, c := range clients {
-		c.Lock()
-		c.close()
-		tls.StopCertificateWatchers(c.tlsSource)
-		c.Unlock()
+		c.clean(true)
 	}
 	return nil
 }
@@ -347,6 +363,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	c := manager.m[dialerConf{dest, streamSettings}]
 	if c == nil {
 		c = &client{
+			instance:     core.FromContext(ctx),
 			dest:         dest,
 			config:       streamSettings.ProtocolSettings.(*Config),
 			tlsConfig:    tlsConfig.GetTLSConfig(tls.WithDestination(dest)),
@@ -357,10 +374,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		manager.m[dialerConf{dest, streamSettings}] = c
 	}
+	manager.Unlock()
 	c.Lock()
 	c.lastUsed = time.Now()
 	c.Unlock()
-	manager.Unlock()
 	// Start executes the first cleanup synchronously, so it must run unlocked.
 	if startTask {
 		if err := cleanupTask.Start(); err != nil {
