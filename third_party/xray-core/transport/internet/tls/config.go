@@ -55,7 +55,7 @@ func masterKeyLogWriter(path string) (*os.File, error) {
 	if writer := masterKeyLogFiles[path]; writer != nil {
 		return writer, nil
 	}
-	writer, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	writer, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}

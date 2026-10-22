@@ -22,7 +22,11 @@ func TestDNSScriptCloseReleasesPoolAndServers(t *testing.T) {
 		t.Fatal(err)
 	}
 	upstream := &closableScriptServer{}
-	server := &DNS{ctx: context.Background(), scriptPath: path, clients: []*Client{{server: upstream}}}
+	script, err := newScriptEngine(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &DNS{ctx: context.Background(), script: script, clients: []*Client{{server: upstream}}}
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}

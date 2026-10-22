@@ -28,8 +28,7 @@ import (
 )
 
 type client struct {
-	sync.Mutex
-
+	lock         chan struct{}
 	instance     *core.Instance
 	forced       bool
 	dest         net.Destination
@@ -186,8 +185,9 @@ func (c *client) dial(ctx context.Context) error {
 			CommonHeaderPadding: []string{AuthRequestPadding.String()},
 		},
 	}
-	resp, err := rt.RoundTrip(req)
+	resp, err := rt.RoundTrip(req.WithContext(ctx))
 	if err != nil {
+		_ = rt.Close()
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
@@ -195,13 +195,15 @@ func (c *client) dial(ctx context.Context) error {
 		_ = pktConn.Close()
 		return err
 	}
+	_ = resp.Body.Close()
+
 	if resp.StatusCode != StatusAuthOK {
+		_ = rt.Close()
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		_ = tr.Close()
 		_ = pktConn.Close()
 		return errors.New("auth failed code ", resp.StatusCode)
 	}
-	_ = resp.Body.Close()
 
 	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
 	down, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
@@ -236,9 +238,18 @@ func (c *client) dial(ctx context.Context) error {
 	return nil
 }
 
+func (c *client) unlock() {
+	<-c.lock
+}
+
 func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
-	c.Lock()
-	defer c.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case c.lock <- struct{}{}:
+		defer c.unlock()
+	}
+	c.lastUsed = time.Now()
 
 	err := c.dial(ctx)
 	if err != nil {
@@ -256,12 +267,18 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		remote: c.conn.RemoteAddr(),
 
 		client: true,
+		lock:   make(chan struct{}, 1),
 	}, nil
 }
 
 func (c *client) udp(ctx context.Context) (stat.Connection, error) {
-	c.Lock()
-	defer c.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case c.lock <- struct{}{}:
+		defer c.unlock()
+	}
+	c.lastUsed = time.Now()
 
 	err := c.dial(ctx)
 	if err != nil {
@@ -272,8 +289,8 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 }
 
 func (c *client) clean(force bool) bool {
-	c.Lock()
-	defer c.Unlock()
+	c.lock <- struct{}{}
+	defer c.unlock()
 	if force {
 		c.forced = true
 	}
@@ -363,6 +380,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	c := manager.m[dialerConf{dest, streamSettings}]
 	if c == nil {
 		c = &client{
+			lock:         make(chan struct{}, 1),
+			lastUsed:     time.Now(),
 			instance:     core.FromContext(ctx),
 			dest:         dest,
 			config:       streamSettings.ProtocolSettings.(*Config),
@@ -375,9 +394,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		manager.m[dialerConf{dest, streamSettings}] = c
 	}
 	manager.Unlock()
-	c.Lock()
-	c.lastUsed = time.Now()
-	c.Unlock()
 	// Start executes the first cleanup synchronously, so it must run unlocked.
 	if startTask {
 		if err := cleanupTask.Start(); err != nil {

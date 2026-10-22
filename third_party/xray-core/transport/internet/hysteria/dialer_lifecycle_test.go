@@ -2,15 +2,37 @@ package hysteria
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/core"
 )
 
+func TestClientLockWaitHonorsCancellation(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			c := &client{lock: make(chan struct{}, 1)}
+			c.lock <- struct{}{}
+			defer c.unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			var err error
+			if network == "tcp" {
+				_, err = c.tcp(ctx)
+			} else {
+				_, err = c.udp(ctx)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("lock wait must respect cancellation: %v", err)
+			}
+		})
+	}
+}
+
 func TestClientManagerRemovesInactiveEntries(t *testing.T) {
 	manager := &clientManager{m: map[dialerConf]*client{
-		{}: {lastUsed: time.Now().Add(-2 * time.Minute)},
+		{}: {lock: make(chan struct{}, 1), lastUsed: time.Now().Add(-2 * time.Minute)},
 	}}
 	manager.clean()
 	if len(manager.m) != 0 {
@@ -25,7 +47,7 @@ func TestClientManagerRemovesInactiveEntries(t *testing.T) {
 }
 
 func TestClientManagerRemovesClosedInstances(t *testing.T) {
-	closed := &client{instance: &core.Instance{}, lastUsed: time.Now()}
+	closed := &client{lock: make(chan struct{}, 1), instance: &core.Instance{}, lastUsed: time.Now()}
 	manager := &clientManager{m: map[dialerConf]*client{{}: closed}}
 	manager.clean()
 	if len(manager.m) != 0 || !closed.forced {
@@ -37,14 +59,14 @@ func TestClientManagerRemovesClosedInstances(t *testing.T) {
 }
 
 func TestClientManagerCleanupDoesNotHoldPoolLock(t *testing.T) {
-	blocked := &client{lastUsed: time.Now().Add(-2 * time.Minute)}
+	blocked := &client{lock: make(chan struct{}, 1), lastUsed: time.Now().Add(-2 * time.Minute)}
 	manager := &clientManager{m: map[dialerConf]*client{{}: blocked}}
-	blocked.Lock()
+	blocked.lock <- struct{}{}
 	done := make(chan struct{})
 	go func() { manager.clean(); close(done) }()
 	// Let cleanup reach the deliberately blocked client before probing the pool.
 	time.Sleep(20 * time.Millisecond)
-	replacement := &client{lastUsed: time.Now()}
+	replacement := &client{lock: make(chan struct{}, 1), lastUsed: time.Now()}
 	updated := make(chan struct{})
 	go func() {
 		manager.Lock()
@@ -55,12 +77,12 @@ func TestClientManagerCleanupDoesNotHoldPoolLock(t *testing.T) {
 	select {
 	case <-updated:
 	case <-time.After(time.Second):
-		blocked.Unlock()
+		blocked.unlock()
 		<-done
 		<-updated
 		t.Fatal("one busy client blocked the shared pool")
 	}
-	blocked.Unlock()
+	blocked.unlock()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
