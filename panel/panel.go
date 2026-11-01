@@ -143,11 +143,12 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 			serial.ToTypedMessage(coreLogConfig.Build()),
 			serial.ToTypedMessage(&mydispatcher.Config{}),
 			serial.ToTypedMessage(&stats.Config{}),
-			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 			serial.ToTypedMessage(policyConfig),
 			serial.ToTypedMessage(dnsConfig),
 			serial.ToTypedMessage(routeConfig),
+			// Start accepting connections only after DNS and routing are ready.
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 		},
 		Inbound:  inBoundConfig,
 		Outbound: outBoundConfig,

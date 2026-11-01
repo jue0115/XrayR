@@ -1,8 +1,8 @@
 # 本地 Xray-core 补丁
 
-基线：上游 [v26.10.21](https://github.com/XTLS/Xray-core/releases/tag/v26.10.21)，
-提交 `1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`。
-XrayR 的 `go.mod` 使用本地版本标识 `v1.261021.0`，并继续通过 `replace`
+基线：上游 [v26.10.31](https://github.com/XTLS/Xray-core/releases/tag/v26.10.31)，
+提交 `a4a3dff5b20c2faae567b742c172c7b95e75c083`。
+XrayR 的 `go.mod` 使用本地版本标识 `v1.261031.0`，并继续通过 `replace`
 引用本目录；源码固定来自上述官方标签，不使用 main 分支或未合入的 PR。
 项目最低 Go 版本、GitHub Actions 均固定为 `1.27.3`，
 Docker 构建镜像使用 `golang:1.27.3-alpine`；本机验证也使用 Go 1.27.3。
@@ -97,7 +97,7 @@ Windows 上游 Unix socket 测试失败，公网 DNS 测试未作为离线验收
   因缺少文件失败，未作为通过项；公网 DNS、外部面板及生产部署不作为本机验收。
 - 此次仅本地同步，不提交、推送、打 tag 或重启生产服务。
 
-## v26.10.21 同步验证
+## v26.10.21 同步验证（历史记录）
 
 - 通过 v26.10.10 基线、本地补丁、v26.10.21 官方源码三方同步；
   采用上游新的根证书依赖 `x509roots/fallback@20261020153306-9f2b28d4331a`，
@@ -131,3 +131,45 @@ Windows 上游 Unix socket 测试失败，公网 DNS 测试未作为离线验收
   对该批配置测试关闭 vet，XrayR 关键包 `go vet` 正常通过。
 - 未修改面板、未部署或重启生产服务；验证完成后发布 XrayR `v1.0.6` tag，
   不移动或覆盖旧 tag。
+
+## v26.10.31 同步验证
+
+- 通过 v26.10.21 官方基线、本地源码和 v26.10.31 标签三方同步全部 157 个
+  上游变更文件；仅 `go.mod` 和 `infra/conf/xray.go` 有本地重叠，自动合并无冲突。
+  资源清理、日志、流量/限速及旧 freedom 配置兼容补丁继续保留。
+- 采用上游默认关闭 TCP 监听 MPTCP 的安全更新（CVE-2026-98432），覆盖
+  未配置 sockopt 和空 sockopt 两种情况。显式 `tcpMptcp: true` 仍能启用，
+  不能将更新内核程序视为修复 Linux 内核；服务器仍应安装操作系统安全补丁。
+  Hysteria2 的 QUIC/UDP 不受这一 TCP 默认值改变影响。
+- XrayR 的 `panel/panel.go` 自行组装 App 列表，单独同步上游入站最后启动的
+  顺序修复，确保 DNS/路由脚本池就绪后再处理连接。新增可稳定复现旧顺序
+  空指针的启动回归测试，修复后连续 10 轮通过；没有修改 SSPanel 面板代码。
+- 采用上游 freedom `blockDelay` 对 DispatchLink 入站的关闭修复、DNS 响应
+  缓冲区边界保护、QUIC 嗅探 CRYPTO 连续性检查、WebSocket 正常关闭处理，
+  以及 XHTTP HTTP/2 参数、Windows 绑定和 Darwin keepalive 等修复。
+- 依赖同步 go-proxyproto v0.16.0；Go 最低版本、本机工具链、Actions/Docker
+  继续使用 1.27.3，保留 v26.10.21 的根证书安全更新。
+- 当前 VLESS Vision/Hysteria2 入站、freedom/SOCKS 出站及服务端文件证书配置
+  无需迁移；旧 freedom `domainStrategy` 仍静默兼容。若另行使用旧 freedom
+  `fragment`/`noises`，上游新增迁移到 FinalMask 的警告，本次未抑制这些警告。
+- 若使用内核 GeoData 自动更新，采用上游 HTTPS、`.dat` 扩展名、256 MiB
+  下载/解压限制、最多 100 个资源及至少一分钟更新间隔；普通本地 GeoData
+  文件不要求改名。Lua 文件扩展名按配置路径检查，不再先解析符号链接目标。
+- XrayR 全包编译检查、关键包 vet、Vision 实际传输及精确计数、Hysteria2、
+  文件证书、SOCKS TCP/UDP/路由、VLESS blockDelay、流量/限速/用户生命周期、
+  日志、旧 freedom 配置和 DNS/路由脚本离线回归通过。
+  Lua、GeoData 下载、TLS、Hysteria、MASQUE、SOCKS、WireGuard、TUN 和
+  XDRIVE 单元测试通过；依赖校验及上游未打补丁文件一致性校验通过。
+  Go 1.27.3 的 Windows amd64/386、Linux amd64/arm64、Darwin amd64/arm64
+  六平台构建通过；构建信息确认使用本地 v1.261031.0 内核及 go-proxyproto v0.16.0。
+- 新增 MPTCP 默认值回归，先建立启用 MPTCP 的正向对照连接，再检查未配置/
+  空 sockopt 的监听不使用 MPTCP。Windows 不支持正向对照，因此明确跳过，
+  不将 TCP 回退误报为安全测试通过；Linux 运行时验收仍需支持 MPTCP 的环境。
+  包含该回归的 Linux amd64 测试程序已交叉编译通过。
+  本机 Docker Linux 引擎未运行，未启动它。
+- GeoData 数据文件、公网 DNS、Windows Unix socket 和生产部署不作为
+  本机完整验收；配置测试关闭上游原有 legacy reverse unreachable 的 vet，
+  XrayR 自身关键包 vet 正常通过。
+- 升级前源码备份在 `.tmp-xray/local-before-v26.10.31`，临时文件仍仅位于
+  XrayR 目录；验证完成后提交并推送 XrayR `v1.0.7` tag，未修改 SSPanel
+  面板、未部署或重启生产服务，不移动或覆盖旧 tag。
